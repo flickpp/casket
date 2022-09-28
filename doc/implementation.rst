@@ -1,3 +1,5 @@
+.. _implementation:
+
 Implementation
 ----------------
 
@@ -50,12 +52,14 @@ We have further notes below this example.
    :linenos:
 
    def application(environ, start_response):
-       # Read 5 bytes to to end of stream - whichever happens first
+       # Read 5 bytes or to end of stream - whichever happens first
        environ['wsgi.input'].read(5)
 
        start_response("200 Ok", [])
        return (b"",)
-   
+
+
+.. _environ-wsgi-errors:
 
 wsgi.errors
 ~~~~~~~~~~~~~~
@@ -99,7 +103,7 @@ The writelines method (line6) accepts any iterable of strings.
 
 
 environ
------------
+~~~~~~~~~~~~
 
 We populate the following standard variables in the environ dict
 

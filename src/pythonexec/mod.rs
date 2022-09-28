@@ -9,35 +9,31 @@ use pyo3::prelude::*;
 
 use crate::config::Config;
 use crate::http::{HttpRequest, HttpResponse};
+use crate::workq;
 
 mod reqlocal;
 mod wsgi;
-
-type ReqSender = simple_work_stealer::Sender<(usize, HttpRequest)>;
 
 pub struct Application {
     wsgi_callable: PyObject,
 }
 
-pub struct Response {
-    pub key: usize,
-    pub http_resp: HttpResponse,
-    pub body: Receiver<Vec<u8>>,
-}
+type RequestSender = workq::Sender<(usize, HttpRequest)>;
+type ResponseReceiver = Receiver<(usize, HttpResponse)>;
 
 pub fn spawn(
     cfg: Arc<Config>,
     application: Application,
     server: (String, u16),
-) -> (ReqSender, Receiver<Response>) {
+) -> (RequestSender, ResponseReceiver) {
     let (resp_send, resp_recv) = channel();
-    let (mut req_send, _) = simple_work_stealer::channel();
+    let mut req_send = workq::new();
 
     for n in 0..cfg.num_threads {
         let resp_send = resp_send.clone();
         let server = server.clone();
         let wsgi_callable = Python::with_gil(|py| application.wsgi_callable.clone_ref(py));
-        let req_recv = req_send.new_receiver();
+        let req_recv = req_send.new_recv();
         let cfg = cfg.clone();
 
         ThreadBuilder::new()
@@ -56,43 +52,35 @@ enum RespBody {
 
 fn run(
     cfg: Arc<Config>,
-    req_recv: simple_work_stealer::Receiver<(usize, HttpRequest)>,
-    resp_send: Sender<Response>,
+    req_recv: workq::Receiver<(usize, HttpRequest)>,
+    resp_send: Sender<(usize, HttpResponse)>,
     server: (String, u16),
     wsgi_callable: PyObject,
 ) {
-    for (key, http_req) in req_recv {
+    for (key, mut http_req) in req_recv {
         reqlocal::init_req_thread();
         reqlocal::set_context(http_req.context.clone());
 
         let (body_send, body) = channel();
-        let context = http_req.context.clone();
-        let keep_alive = http_req.keep_alive;
 
-        let (resp_header, resp_body) = match wsgi::execute(&wsgi_callable, &server, http_req) {
+        let (resp_header, resp_body) = match wsgi::execute(&wsgi_callable, &server, &mut http_req) {
             Ok((resp_header, bytes_iter)) => (resp_header, RespBody::PyIterator(bytes_iter)),
-            Err(py_err) => match wsgi::handle_python_exc(&cfg, py_err) {
-                Ok((resp_header, body)) => (resp_header, RespBody::Memory(body)),
-                Err(_err) => {
-                    error!("unable to handle python exception", { error = "an error" });
-                    continue;
-                }
-            },
+            Err(exec_error) => {
+                error!("python application raised exception", {
+                    trace_id                   = &http_req.context.trace_id,
+                    span_id                    = &http_req.context.span_id,
+                    parent_id   : Option<&str> = http_req.context.parent_id_as_ref(),
+                    error                      = &exec_error.value,
+                    traceback                  = &exec_error.traceback
+                });
+
+                let (resp_header, resp_body) = wsgi::handle_wsgi_exec_err(&cfg, exec_error);
+                (resp_header, RespBody::Memory(resp_body))
+            }
         };
 
-        let resp = Response {
-            key,
-            body,
-            http_resp: HttpResponse {
-                keep_alive,
-                context,
-                code: resp_header.code,
-                reason: resp_header.reason,
-                headers: resp_header.headers,
-            },
-        };
-
-        if resp_send.send(resp).is_err() {
+        let http_resp = http_req.into_http_response(resp_header, body);
+        if resp_send.send((key, http_resp)).is_err() {
             // Main process has died
             return;
         }

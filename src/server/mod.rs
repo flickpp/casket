@@ -5,7 +5,7 @@ use std::sync::Arc;
 use fd_queue::mio::UnixStream;
 use libc::pid_t;
 use mio::{net::TcpListener, Events, Interest, Poll, Token};
-use ndjsonlogger::debug;
+use ndjsonlogger::{debug, warn};
 
 use crate::config::Config;
 use crate::errors::{fatal_io_error, RuntimeError, RuntimeResult};
@@ -15,7 +15,6 @@ use unixstreams::{UnixStream as ServerUnixStream, UnixStreams as ServerUnixStrea
 
 pub fn run_server(
     cfg: Arc<Config>,
-    _callable: &str,
     mut listener: TcpListener,
     unix_streams: Vec<(pid_t, UnixStream)>,
 ) -> RuntimeResult {
@@ -79,6 +78,9 @@ pub fn run_server(
 
                     if reading_streams.len() + processing_streams.len() >= cfg.max_conns {
                         // Drop stream now
+                        warn!("maximum number of tcp streams exceeded", {
+                            "cfg.max_conns": usize = cfg.max_conns
+                        });
                         continue;
                     }
 

@@ -2,16 +2,17 @@ use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::prelude::RawFd;
 use std::result;
-use std::sync::mpsc::{channel, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time;
 
 use fd_queue::mio::UnixStream;
 use mio::{net::TcpStream, Events, Interest, Poll, Registry, Token};
+use ndjsonlogger::info;
 
 use crate::config::Config;
 use crate::errors::{fatal_io_error, RuntimeError, RuntimeResult};
-use crate::http::{Context, HttpRequest, HttpResponse};
+use crate::http::{HttpRequest, HttpResponse};
 use crate::msgs;
 use crate::pythonexec;
 
@@ -20,6 +21,7 @@ use readingstream::{ReadError, ReadState, ReadingStream};
 mod writingstream;
 use writingstream::{WriteError, WriteState, WritingStream};
 
+/*
 lazy_static! {
     static ref TOO_BUSY_RESP: HttpResponse = HttpResponse {
         code: 503,
@@ -29,6 +31,7 @@ lazy_static! {
         keep_alive: false,
     };
 }
+*/
 
 #[derive(Default)]
 struct TcpStreams {
@@ -49,9 +52,9 @@ enum Action {
     None,
     NewReadStream((Token, TcpStream)),
     ContinueReadStream((Token, TcpStream, ReadingStream)),
-    NewWriteStream(pythonexec::Response),
+    NewWriteStream((usize, Box<HttpResponse>)),
     ContinueWriteStream((Token, TcpStream, WritingStream)),
-    DoneWriteStream((Token, TcpStream, bool)),
+    DoneWriteStream((Token, TcpStream, Box<HttpResponse>)),
     NewProcessStream((Token, TcpStream, Box<HttpRequest>)),
     NewBusyStream(Box<HttpRequest>),
 }
@@ -192,7 +195,7 @@ pub fn run_worker(
                     &mut msg_buffer,
                 ),
                 Err(err) => {
-                    handle_error(err, poll.registry(), &mut msg_buffer)?;
+                    handle_error(&cfg, err, poll.registry(), &mut msg_buffer)?;
                 }
             }
         }
@@ -200,31 +203,48 @@ pub fn run_worker(
 }
 
 fn handle_error(
+    cfg: &Config,
     err: Error,
     registry: &Registry,
     msg_buffer: &mut msgs::WorkerMsgBuffer,
 ) -> RuntimeResult {
     match err {
         Error::PythonThreadsDied => Err(RuntimeError::PythonThreadsDied),
-        Error::Read((tk, mut tcp_stream, read_error)) => match read_error {
-            ReadError::Io(err) => {
-                registry.deregister(&mut tcp_stream).unwrap_or(());
-                msg_buffer.resp_io_error(tk, err);
-                Ok(())
+        Error::Read((tk, mut tcp_stream, read_error)) => {
+            let error = match read_error {
+                ReadError::Io(err) => {
+                    registry.deregister(&mut tcp_stream).unwrap_or(());
+                    msg_buffer.resp_io_error(tk, err);
+                    "i/o error reading tcp stream"
+                }
+                ReadError::Httparse(_) => {
+                    registry.deregister(&mut tcp_stream).unwrap_or(());
+                    msg_buffer.resp_bad_client(tk);
+                    "invalid http header"
+                }
+                ReadError::BadValue(err) => {
+                    registry.deregister(&mut tcp_stream).unwrap_or(());
+                    msg_buffer.resp_bad_client(tk);
+                    err
+                }
+            };
+
+            if cfg.log_response {
+                info!("failed to read http request", { error });
             }
-            ReadError::Httparse(_) => {
-                registry.deregister(&mut tcp_stream).unwrap_or(());
-                msg_buffer.resp_bad_client(tk);
-                Ok(())
-            }
-            ReadError::BadValue(_) => {
-                registry.deregister(&mut tcp_stream).unwrap_or(());
-                msg_buffer.resp_bad_client(tk);
-                Ok(())
-            }
-        },
+
+            Ok(())
+        }
         Error::Write((tk, mut tcp_stream, write_error)) => match write_error {
-            WriteError::Io(err) => {
+            WriteError::Io((err, http_resp)) => {
+                if cfg.log_response {
+                    info!("failed to write http response to tcp stream", {
+                        error                    = &format!("{}", err),
+                        trace_id                 = &http_resp.context.trace_id,
+                        span_id                  = &http_resp.context.span_id,
+                        parent_id: Option<&str>  = http_resp.context.parent_id_as_ref()
+                    });
+                }
                 registry.deregister(&mut tcp_stream).unwrap_or(());
                 msg_buffer.resp_io_error(tk, err);
                 Ok(())
@@ -259,8 +279,8 @@ fn handle_action(
                 .reading_streams
                 .insert(tk, (tcp_stream, reading_stream));
         }
-        Action::NewWriteStream(resp) => {
-            let tk = Token(resp.key);
+        Action::NewWriteStream((key, http_resp)) => {
+            let tk = Token(key);
             let mut tcp_stream = tcp_streams
                 .processing_streams
                 .remove(&tk)
@@ -271,23 +291,37 @@ fn handle_action(
                 return;
             }
 
-            tcp_streams.writing_streams.insert(
-                tk,
-                (tcp_stream, WritingStream::new(resp.http_resp, resp.body)),
-            );
+            let buffer = vec![0; 4096];
+
+            tcp_streams
+                .writing_streams
+                .insert(tk, (tcp_stream, WritingStream::new(http_resp, buffer)));
         }
         Action::ContinueWriteStream((tk, tcp_stream, writing_stream)) => {
             tcp_streams
                 .writing_streams
                 .insert(tk, (tcp_stream, writing_stream));
         }
-        Action::DoneWriteStream((tk, mut tcp_stream, keep_alive)) => {
+        Action::DoneWriteStream((tk, mut tcp_stream, http_resp)) => {
+            if cfg.log_response {
+                info!("request complete", {
+                    "http.status_code": u16           = http_resp.code,
+                    "http.method"                     = http_resp.method.as_ref(),
+                    "http.url.path"                   = http_resp.url.path(),
+                    "http.req_content_length" :usize  = http_resp.req_content_length,
+                    "http.resp_content_length":usize  = http_resp.resp_content_length.unwrap_or(0),
+                    trace_id                          = &http_resp.context.trace_id,
+                    span_id                           = &http_resp.context.span_id,
+                    parent_id: Option<&str>           = http_resp.context.parent_id_as_ref()
+                });
+            }
+
             if let Err(e) = registry.deregister(&mut tcp_stream) {
                 msg_buffer.resp_stream_reg_error(tk, e);
                 return;
             }
 
-            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), keep_alive);
+            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), http_resp.keep_alive);
         }
         Action::NewProcessStream((tk, mut tcp_stream, http_req)) => {
             if let Err(e) = registry.deregister(&mut tcp_stream) {
@@ -303,24 +337,26 @@ fn handle_action(
                 http_too_busy_reqs.push(*http_req);
             }
         }
-        Action::NewBusyStream(http_req) => {
-            let (tk, mut tcp_stream) = tcp_streams
-                .too_busy_streams
-                .pop_front()
-                .expect("too busy streams deque empty");
+        _ => {} /*
+                    Action::NewBusyStream(http_req) => {
+                        let (tk, mut tcp_stream) = tcp_streams
+                            .too_busy_streams
+                            .pop_front()
+                            .expect("too busy streams deque empty");
 
-            let (_, bod_recv) = channel();
-            let writing_stream = WritingStream::new(too_busy_resp(http_req), bod_recv);
+                        let (_, bod_recv) = channel();
+                        let writing_stream = WritingStream::new(too_busy_resp(http_req), boyd_recv);
 
-            if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::WRITABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
+                        if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::WRITABLE) {
+                            msg_buffer.resp_stream_reg_error(tk, e);
+                            return;
+                        }
 
-            tcp_streams
-                .writing_streams
-                .insert(tk, (tcp_stream, writing_stream));
-        }
+                        tcp_streams
+                            .writing_streams
+                            .insert(tk, (tcp_stream, writing_stream));
+                }
+                    */
     }
 }
 
@@ -350,22 +386,24 @@ fn handle_write_stream(tk: Token, mut stream: TcpStream, writing_stream: Writing
             Ok(Action::ContinueWriteStream((tk, stream, writing_stream)))
         }
 
-        Ok(WriteState::Done(keep_alive)) => Ok(Action::DoneWriteStream((tk, stream, keep_alive))),
+        Ok(WriteState::Done(http_resp)) => Ok(Action::DoneWriteStream((tk, stream, http_resp))),
     }
 }
 
 fn handle_try_recv_processing_stream(
-    res: result::Result<pythonexec::Response, TryRecvError>,
+    res: result::Result<(usize, HttpResponse), TryRecvError>,
 ) -> Result {
     match res {
-        Ok(resp) => Ok(Action::NewWriteStream(resp)),
+        Ok((key, http_resp)) => Ok(Action::NewWriteStream((key, Box::new(http_resp)))),
         Err(TryRecvError::Empty) => Ok(Action::None),
         Err(TryRecvError::Disconnected) => Err(Error::PythonThreadsDied),
     }
 }
 
+/*
 fn too_busy_resp(http_req: Box<HttpRequest>) -> HttpResponse {
     let mut resp = TOO_BUSY_RESP.clone();
     resp.context = http_req.context;
     resp
 }
+*/

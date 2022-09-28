@@ -48,5 +48,6 @@ Reference
 ==================
 
 .. toctree::
+   statuscodes.rst
    configuration.rst
    implementation.rst

@@ -1,17 +1,37 @@
+use std::result;
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyIterator, PyList, PyString, PyTuple};
 
 use crate::config::Config;
-use crate::http::HttpRequest;
+use crate::http::{HttpRequest, HttpResponseHeader as ResponseHeader};
+use ndjsonlogger::error;
 
 use super::reqlocal;
+
+pub struct ExecError {
+    pub traceback: String,
+    pub value: String,
+    pub py_err: PyErr,
+}
+
+pub type ExecResult<T> = result::Result<T, ExecError>;
 
 pub fn execute(
     wsgi_callable: &PyObject,
     server: &(String, u16),
-    http_req: HttpRequest,
-) -> PyResult<(reqlocal::ResponseHeader, BytesIter)> {
+    http_req: &mut HttpRequest,
+) -> ExecResult<(ResponseHeader, BytesIter)> {
+    execute_inner(wsgi_callable, server, http_req)
+        .map_err(|py_err| Python::with_gil(|py| build_exec_err(py, py_err)))
+}
+
+fn execute_inner(
+    wsgi_callable: &PyObject,
+    server: &(String, u16),
+    http_req: &mut HttpRequest,
+) -> PyResult<(ResponseHeader, BytesIter)> {
     let start_response = StartResponse {};
     let bytes_iter = Python::with_gil(|py| -> PyResult<Py<PyIterator>> {
         let environ = build_environ(py, server, http_req)?;
@@ -30,56 +50,61 @@ pub fn execute(
     Ok((response_header, bytes_iter))
 }
 
-pub fn handle_python_exc(
-    cfg: &Config,
-    exc: PyErr,
-) -> PyResult<(reqlocal::ResponseHeader, Vec<u8>)> {
+fn build_exec_err(py: Python, py_err: PyErr) -> ExecError {
+    let traceback = py_err.traceback(py).map(|t| t.format()).transpose();
+
+    let traceback = match traceback {
+        Ok(Some(t)) => t,
+        _ => String::from(""),
+    };
+
+    let value = py_err.value(py).to_string();
+
+    ExecError {
+        traceback,
+        value,
+        py_err,
+    }
+}
+
+pub fn handle_wsgi_exec_err(cfg: &Config, err: ExecError) -> (ResponseHeader, Vec<u8>) {
     if cfg.body_stacktrace {
-        Python::with_gil(|py| handle_python_exc_body_stacktrace(py, exc))
+        handle_python_exc_body_stacktrace(err)
     } else {
         handle_python_exc_empty()
     }
 }
 
-fn handle_python_exc_body_stacktrace(
-    py: Python,
-    exc: PyErr,
-) -> PyResult<(reqlocal::ResponseHeader, Vec<u8>)> {
-    let traceback = exc
-        .traceback(py)
-        .map(|t| t.format())
-        .transpose()?
-        .unwrap_or_else(|| String::from(""))
-        .into_bytes();
-
-    let x_error = exc.value(py).to_string();
-
+fn handle_python_exc_body_stacktrace(err: ExecError) -> (ResponseHeader, Vec<u8>) {
     let headers = vec![
-        ("Content-Length".to_string(), traceback.len().to_string()),
+        (
+            "Content-Length".to_string(),
+            err.traceback.as_bytes().len().to_string(),
+        ),
         (
             "Content-Type".to_string(),
             "text/plain; charset=UTF-8".to_string(),
         ),
-        ("X-Error".to_string(), x_error),
+        ("X-Error".to_string(), err.value),
     ];
 
-    let resp_header = reqlocal::ResponseHeader {
+    let resp_header = ResponseHeader {
         code: 500,
         reason: String::from("Internal Server Error"),
         headers,
     };
 
-    Ok((resp_header, traceback))
+    (resp_header, err.traceback.into_bytes())
 }
 
-fn handle_python_exc_empty() -> PyResult<(reqlocal::ResponseHeader, Vec<u8>)> {
-    let resp_header = reqlocal::ResponseHeader {
+fn handle_python_exc_empty() -> (ResponseHeader, Vec<u8>) {
+    let resp_header = ResponseHeader {
         code: 500,
         reason: String::from("Internal Server Error"),
         headers: vec![("Content-Length".to_string(), "0".to_string())],
     };
 
-    Ok((resp_header, vec![]))
+    (resp_header, vec![])
 }
 
 pub struct BytesIter {
@@ -140,7 +165,7 @@ impl StartResponse {
             resp_headers.push((key.to_string(), value.to_string()));
         }
 
-        reqlocal::put_response_header(reqlocal::ResponseHeader {
+        reqlocal::put_response_header(ResponseHeader {
             code,
             reason,
             headers: resp_headers,
@@ -153,7 +178,7 @@ impl StartResponse {
 fn build_environ(
     py: Python,
     server: &(String, u16),
-    mut http_req: HttpRequest,
+    http_req: &mut HttpRequest,
 ) -> PyResult<Py<PyDict>> {
     let environ = PyDict::new(py);
 
@@ -169,8 +194,9 @@ fn build_environ(
     if let Some(ref content_type) = http_req.content_type {
         environ.set_item("CONTENT_TYPE", content_type)?;
     }
-    if let Some(content_length) = http_req.content_length {
-        environ.set_item("CONTENT_LENGTH", content_length)?;
+
+    if let Some(body) = http_req.body.as_ref() {
+        environ.set_item("CONTENT_LENGTH", body.len())?;
     }
 
     environ.set_item("SERVER_NAME", &server.0)?;
@@ -188,7 +214,8 @@ fn build_environ(
     environ.set_item("wsgi.version", (1, 0))?;
     environ.set_item("wsgi.url_scheme", "http")?;
 
-    environ.set_item("wsgi.input", Py::new(py, WsgiInput::new(http_req.body))?)?;
+    let body = http_req.body.take().unwrap_or_default();
+    environ.set_item("wsgi.input", Py::new(py, WsgiInput::new(body))?)?;
 
     environ.set_item("wsgi.errors", Py::new(py, WsgiError {})?)?;
 
@@ -198,9 +225,9 @@ fn build_environ(
 
     // Casket specific
     let trace_ctx = TraceContext {
-        trace_id: http_req.context.trace_id,
-        span_id: http_req.context.span_id,
-        parent_id: http_req.context.parent_id,
+        trace_id: http_req.context.trace_id.clone(),
+        span_id: http_req.context.span_id.clone(),
+        parent_id: http_req.context.parent_id.clone(),
     };
     environ.set_item("casket.trace_ctx", Py::new(py, trace_ctx)?)?;
 

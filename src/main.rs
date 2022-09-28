@@ -7,9 +7,6 @@ use fork::fork;
 use mio::net::TcpListener;
 use ndjsonlogger::{error, info};
 
-#[macro_use]
-extern crate lazy_static;
-
 mod config;
 mod http;
 mod msgs;
@@ -20,6 +17,7 @@ use worker::run_worker;
 mod errors;
 use errors::{fatal_io_error, RuntimeError, RuntimeResult};
 mod pythonexec;
+mod workq;
 
 fn main() {
     // argv[1] must be file_name:func_name string for WSGI entry point
@@ -78,6 +76,16 @@ fn run(
         }
     }
 
+    info!("casket started", {
+        callable,
+        ["casket.version"      : usize = [cfg.version.0, cfg.version.1]],
+        "cfg.num_workers"      : usize = cfg.num_workers,
+        "cfg.num_threads"      : usize = cfg.num_threads,
+        "cfg.max_connections"  : usize = cfg.max_conns,
+        "cfg.max_requests"     : usize = cfg.max_requests,
+        "cfg.return_stacktrace": bool  = cfg.body_stacktrace
+    });
+
     drop(application);
-    run_server(cfg, callable, listener, parent_socks)
+    run_server(cfg, listener, parent_socks)
 }

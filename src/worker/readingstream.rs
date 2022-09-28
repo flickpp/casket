@@ -100,13 +100,13 @@ impl From<PartialHttpReq> for HttpRequest {
     fn from(req: PartialHttpReq) -> HttpRequest {
         HttpRequest {
             method: req.method,
-            context: req.context,
-            headers: req.headers,
             url: req.url,
-            content_type: req.content_type,
-            content_length: Some(req.content_length),
-            body: req.body,
+            headers: req.headers,
+            context: req.context,
             keep_alive: req.keep_alive,
+            content_type: req.content_type,
+            content_length: req.content_length,
+            body: Some(req.body),
         }
     }
 }

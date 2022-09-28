@@ -13,6 +13,7 @@ pub struct Config {
     pub max_conns: usize,
     pub max_requests: usize,
     pub body_stacktrace: bool,
+    pub log_response: bool,
     pub version: (usize, usize),
 }
 
@@ -31,6 +32,7 @@ impl Default for Config {
             max_conns: 128,
             max_requests: 12,
             body_stacktrace: true,
+            log_response: true,
             version: VERSION,
         }
     }
@@ -68,6 +70,23 @@ impl Config {
                     const ERR_STR: &str = "CASKET_RETURN_STACKTRACE_IN_BODY must be 0 or 1";
 
                     slf.body_stacktrace =
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| ERR_STR)
+                            .and_then(|val| {
+                                if val == 0 {
+                                    Ok(false)
+                                } else if val == 1 {
+                                    Ok(true)
+                                } else {
+                                    Err(ERR_STR)
+                                }
+                            })?;
+                }
+                "CASKET_LOG_HTTP_RESPONSE" => {
+                    const ERR_STR: &str = "CASKET_LOG_HTTP_RESPONSE must be 0 or 1";
+
+                    slf.log_response =
                         value
                             .parse::<usize>()
                             .map_err(|_| ERR_STR)
