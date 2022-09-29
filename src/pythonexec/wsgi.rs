@@ -265,6 +265,11 @@ impl WsgiInput {
     }
 }
 
+#[pyclass]
+struct WsgiInputIter {
+    input: Py<WsgiInput>,
+}
+
 #[pymethods]
 impl WsgiInput {
     #[args(size = "None")]
@@ -307,11 +312,46 @@ impl WsgiInput {
     }
 
     #[args(size = "None")]
-    fn readlines(&mut self, py: Python, size: Option<usize>) -> PyResult<Py<PyBytes>> {
-        self.read(py, size)
+    fn readlines(&mut self, py: Python, size: Option<usize>) -> PyResult<Py<PyList>> {
+        let list = PyList::empty(py);
+
+        for n in 1.. {
+            let line = self.readline(py, None)?;
+            list.append(line)?;
+
+            if let Some(size) = size {
+                if size == n {
+                    return Ok(list.into());
+                }
+            }
+        }
+
+        Ok(list.into())
     }
 
-    // TODO: iter
+    fn __iter__(slf: Py<Self>, py: Python) -> PyResult<Py<WsgiInputIter>> {
+        let iter = WsgiInputIter { input: slf };
+        Py::new(py, iter)
+    }
+}
+
+#[pymethods]
+impl WsgiInputIter {
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> Option<u8> {
+        let mut input = self.input.borrow_mut(py);
+        if input.pos == input.body.len() {
+            return None;
+        }
+
+        let byte = input.body[input.pos];
+        input.pos += 1;
+
+        Some(byte)
+    }
 }
 
 #[pyclass]
