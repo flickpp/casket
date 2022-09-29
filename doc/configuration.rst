@@ -171,3 +171,19 @@ Set this value to:
 
 | ``CASKET_LOG_HTTP_RESPONSE=0`` (feature off)
 | ``CASKET_LOG_HTTP_RESPONSE=1`` (feature on)
+
+
+CASKET_CTRLC_WAIT_TIME
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``DEFAULT: 10``
+
+When Casket receives ctrl-c (or SIGINT inside a Docker container) it will finish
+processing any active requests, notify client(s) with socket shutdown then exit.
+
+If after time ``CASKET_CTRLC_WAIT_TIME`` there are still active requests then
+Casket will exit anyway. The value is given in seconds.
+
+Example:
+
+``CASKET_CTRLC_WAIT_TIME=25``

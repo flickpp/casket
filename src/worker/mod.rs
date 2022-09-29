@@ -68,6 +68,7 @@ type Result = result::Result<Action, Error>;
 pub fn run_worker(
     cfg: Arc<Config>,
     running: Arc<AtomicBool>,
+    close_now: Arc<AtomicBool>,
     application: pythonexec::Application,
     mut stream: UnixStream,
 ) -> RuntimeResult {
@@ -92,9 +93,28 @@ pub fn run_worker(
     let mut http_reqs: Vec<(Token, HttpRequest)> = Vec::with_capacity(16);
     let mut http_too_busy_reqs: Vec<HttpRequest> = Vec::with_capacity(16);
     let mut closing = false;
+    let mut ctrlc_instant: Option<time::SystemTime> = None;
 
     loop {
+        // Gracefully close after SIGINT
         if closing && tcp_streams.is_empty() && !msg_buffer.has_data_to_send() {
+            break Ok(());
+        }
+
+        // Close due to CTRLC_WAIT_TIME expiring
+        if let Some(instant) = ctrlc_instant {
+            match instant.elapsed() {
+                Err(_) => break Ok(()),
+                Ok(duration) => {
+                    if duration > cfg.ctrlc_wait_time {
+                        break Ok(());
+                    }
+                }
+            }
+        }
+
+        // Close now due to second SIGINT
+        if close_now.load(Ordering::SeqCst) {
             break Ok(());
         }
 
@@ -139,6 +159,7 @@ pub fn run_worker(
         let poll_res = poll.poll(&mut events, timeout);
         if poll_res.is_err() || !running.load(Ordering::SeqCst) {
             closing = true;
+            ctrlc_instant = Some(time::SystemTime::now());
         }
 
         for ev in &events {

@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::result;
+use std::time;
 
 const VERSION: (usize, usize) = (0, 1);
 
@@ -14,6 +15,7 @@ pub struct Config {
     pub max_requests: usize,
     pub body_stacktrace: bool,
     pub log_response: bool,
+    pub ctrlc_wait_time: time::Duration,
     pub version: (usize, usize),
 }
 
@@ -33,6 +35,7 @@ impl Default for Config {
             max_requests: 12,
             body_stacktrace: true,
             log_response: true,
+            ctrlc_wait_time: time::Duration::from_secs(10),
             version: VERSION,
         }
     }
@@ -104,6 +107,14 @@ impl Config {
                                     Err(ERR_STR)
                                 }
                             })?;
+                }
+                "CASKET_CTRLC_WAIT_TIME" => {
+                    const ERR_STR: &str = "CASKET_CTRLC_WAIT_TIME must be a positive integer";
+
+                    slf.ctrlc_wait_time = value
+                        .parse::<u64>()
+                        .map_err(|_| ERR_STR)
+                        .map(time::Duration::from_secs)?;
                 }
                 _ => {}
             }

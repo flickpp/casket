@@ -19,6 +19,7 @@ use shutdown::{shutdown_loop, ShutdownData};
 pub fn run_server(
     cfg: Arc<Config>,
     running: Arc<AtomicBool>,
+    close_now: Arc<AtomicBool>,
     mut listener: TcpListener,
     unix_streams: Vec<(pid_t, UnixStream)>,
 ) -> RuntimeResult {
@@ -46,10 +47,33 @@ pub fn run_server(
     let mut processing_streams = HashMap::<Token, TcpStream>::new();
 
     let mut run_shutdown = false;
+    let mut ctrlc_instant: Option<time::SystemTime> = None;
 
     // Exit after we've run shutdown and there are no more processing streams
     loop {
+        // Close gracefully after a SIGINT
         if run_shutdown && processing_streams.is_empty() {
+            break Ok(());
+        }
+
+        // SIGINT happened and CTRLC_WAIT_TIME has expired
+        if let Some(instant) = ctrlc_instant {
+            match instant.elapsed() {
+                Err(_) => break Ok(()),
+                Ok(elapsed) => {
+                    if elapsed >= cfg.ctrlc_wait_time {
+                        // Send shutdown to all sockets
+                        for (_, tcp_stream) in processing_streams.drain() {
+                            tcp_stream.shutdown(std::net::Shutdown::Both).unwrap_or(());
+                        }
+                        break Ok(());
+                    }
+                }
+            }
+        }
+
+        // Second SIGINT - exit now
+        if close_now.load(Ordering::SeqCst) {
             break Ok(());
         }
 
@@ -102,6 +126,7 @@ pub fn run_server(
                 poll: &poll,
             }));
 
+            ctrlc_instant = Some(time::SystemTime::now());
             run_shutdown = true;
         }
 
