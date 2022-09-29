@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
+use std::time;
 
 use fd_queue::mio::UnixStream;
 use libc::pid_t;
-use mio::{net::TcpListener, Events, Interest, Poll, Token};
+use mio::{net::TcpListener, net::TcpStream, Events, Interest, Poll, Token};
 use ndjsonlogger::{debug, warn};
 
 use crate::config::Config;
@@ -12,9 +13,12 @@ use crate::errors::{fatal_io_error, RuntimeError, RuntimeResult};
 
 mod unixstreams;
 use unixstreams::{UnixStream as ServerUnixStream, UnixStreams as ServerUnixStreams};
+mod shutdown;
+use shutdown::{shutdown_loop, ShutdownData};
 
 pub fn run_server(
     cfg: Arc<Config>,
+    running: Arc<AtomicBool>,
     mut listener: TcpListener,
     unix_streams: Vec<(pid_t, UnixStream)>,
 ) -> RuntimeResult {
@@ -39,35 +43,66 @@ pub fn run_server(
 
     let mut errors = Vec::with_capacity(32);
     let mut reading_streams = HashMap::new();
-    let mut processing_streams = HashMap::new();
+    let mut processing_streams = HashMap::<Token, TcpStream>::new();
 
+    let mut run_shutdown = false;
+
+    // Exit after we've run shutdown and there are no more processing streams
     loop {
+        if run_shutdown && processing_streams.is_empty() {
+            break Ok(());
+        }
+
         errors.extend(unix_streams.reregister(poll.registry()));
 
         for tk in unix_streams.next_stream_tks() {
             let mut tcp_stream = processing_streams
                 .remove(&tk)
                 .expect("couldn't find processing tream");
-            if let Err(e) = poll
-                .registry()
-                .register(&mut tcp_stream, tk, Interest::READABLE)
-            {
-                errors.push(e);
-                continue;
-            }
 
-            reading_streams.insert(tk, tcp_stream);
+            if run_shutdown {
+                if let Err(e) = tcp_stream.shutdown(std::net::Shutdown::Both) {
+                    errors.push(e);
+                }
+            } else {
+                if let Err(e) = poll
+                    .registry()
+                    .register(&mut tcp_stream, tk, Interest::READABLE)
+                {
+                    errors.push(e);
+                    continue;
+                }
+
+                reading_streams.insert(tk, tcp_stream);
+            }
         }
 
         for tk in unix_streams.next_stream_close_tks() {
-            processing_streams
+            let tcp_stream = processing_streams
                 .remove(&tk)
                 .expect("couldn't find processing tream");
+
+            if let Err(e) = tcp_stream.shutdown(std::net::Shutdown::Both) {
+                errors.push(e);
+            }
         }
 
-        if poll.poll(&mut events, None).is_err() {
-            // Ctrl-C
-            return Ok(());
+        let timeout = if run_shutdown {
+            Some(time::Duration::from_millis(100))
+        } else {
+            None
+        };
+        let poll_res = poll.poll(&mut events, timeout);
+
+        // Check we're running
+        if (poll_res.is_err() || !running.load(Ordering::SeqCst)) && !run_shutdown {
+            errors.extend(shutdown_loop(ShutdownData {
+                listener: &mut listener,
+                reading_streams: &mut reading_streams,
+                poll: &poll,
+            }));
+
+            run_shutdown = true;
         }
 
         for ev in &events {
@@ -105,6 +140,7 @@ pub fn run_server(
 
                 unix_streams.msg_send_tcp_stream(ev.token(), tcp_stream.as_raw_fd());
                 processing_streams.insert(ev.token(), tcp_stream);
+
                 continue;
             }
 

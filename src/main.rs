@@ -1,11 +1,11 @@
 use std::env;
 use std::process;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
 use fd_queue::mio::UnixStream;
 use fork::fork;
 use mio::net::TcpListener;
-use ndjsonlogger::{error, info};
+use ndjsonlogger::{error, info, warn};
 
 mod config;
 mod http;
@@ -63,6 +63,16 @@ fn run(
 
     let mut parent_socks = vec![];
 
+    // Ctrl-C handler in server
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    if let Err(e) = ctrlc::set_handler(move || r.store(false, Ordering::SeqCst)) {
+        warn!("failed to register ctrlc handler - no graceful shutdown", {
+            error = &format!("{}", e)
+        });
+    }
+
     for _ in 0..cfg.num_workers {
         let (sock1, sock2) = UnixStream::pair()
             .map_err(|err| fatal_io_error("couldn't create unix socket pair", err))?;
@@ -71,7 +81,7 @@ fn run(
             Ok(fork::Fork::Parent(pid)) => {
                 parent_socks.push((pid, sock1));
             }
-            Ok(fork::Fork::Child) => return run_worker(cfg, application, sock2),
+            Ok(fork::Fork::Child) => return run_worker(cfg, running, application, sock2),
             Err(_) => return Err(RuntimeError::ForkFailed),
         }
     }
@@ -87,5 +97,9 @@ fn run(
     });
 
     drop(application);
-    run_server(cfg, listener, parent_socks)
+
+    run_server(cfg, running, listener, parent_socks)?;
+
+    info!("casket closing");
+    Ok(())
 }

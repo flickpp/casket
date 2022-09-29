@@ -3,7 +3,7 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::prelude::RawFd;
 use std::result;
 use std::sync::mpsc::TryRecvError;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 use std::time;
 
 use fd_queue::mio::UnixStream;
@@ -36,6 +36,15 @@ struct TcpStreams {
     writing_streams: HashMap<Token, (TcpStream, WritingStream)>,
 }
 
+impl TcpStreams {
+    fn is_empty(&self) -> bool {
+        self.reading_streams.is_empty()
+            && self.processing_streams.is_empty()
+            && self.too_busy_streams.is_empty()
+            && self.writing_streams.is_empty()
+    }
+}
+
 enum Action {
     None,
     NewReadStream((Token, TcpStream)),
@@ -45,6 +54,7 @@ enum Action {
     DoneWriteStream((Token, TcpStream, Box<HttpResponse>)),
     NewProcessStream((Token, TcpStream, Box<HttpRequest>)),
     NewBusyStream(Box<HttpRequest>),
+    StreamEOF((Token, TcpStream)),
 }
 
 enum Error {
@@ -57,6 +67,7 @@ type Result = result::Result<Action, Error>;
 
 pub fn run_worker(
     cfg: Arc<Config>,
+    running: Arc<AtomicBool>,
     application: pythonexec::Application,
     mut stream: UnixStream,
 ) -> RuntimeResult {
@@ -80,8 +91,13 @@ pub fn run_worker(
     let mut results = Vec::with_capacity(64);
     let mut http_reqs: Vec<(Token, HttpRequest)> = Vec::with_capacity(16);
     let mut http_too_busy_reqs: Vec<HttpRequest> = Vec::with_capacity(16);
+    let mut closing = false;
 
     loop {
+        if closing && tcp_streams.is_empty() && !msg_buffer.has_data_to_send() {
+            break Ok(());
+        }
+
         // If we have responses, make sure our unix stream is registered for writing
         if msg_buffer.has_data_to_send() && !unix_stream_interest.is_writable() {
             unix_stream_interest = Interest::READABLE | Interest::WRITABLE;
@@ -120,9 +136,9 @@ pub fn run_worker(
             None
         };
 
-        if poll.poll(&mut events, timeout).is_err() {
-            // Exit gracefully - this is caused by Ctrl-C
-            return Ok(());
+        let poll_res = poll.poll(&mut events, timeout);
+        if poll_res.is_err() || !running.load(Ordering::SeqCst) {
+            closing = true;
         }
 
         for ev in &events {
@@ -354,6 +370,14 @@ fn handle_action(
                 .writing_streams
                 .insert(tk, (tcp_stream, writing_stream));
         }
+        Action::StreamEOF((tk, mut tcp_stream)) => {
+            if let Err(e) = registry.deregister(&mut tcp_stream) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
+        }
     }
 }
 
@@ -372,6 +396,8 @@ fn handle_read_stream(tk: Token, mut stream: TcpStream, reading_stream: ReadingS
         }
 
         Ok(ReadState::Complete(http_req)) => Ok(Action::NewProcessStream((tk, stream, http_req))),
+
+        Ok(ReadState::StreamEOF) => Ok(Action::StreamEOF((tk, stream))),
     }
 }
 
