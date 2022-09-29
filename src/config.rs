@@ -66,6 +66,11 @@ impl Config {
                         .parse()
                         .map_err(|_| "CASKET_MAX_CONNECTIONS must be positive integer")?;
                 }
+                "CASKET_MAX_REQUESTS" => {
+                    slf.max_requests = value
+                        .parse()
+                        .map_err(|_| "CASKET_MAX_REQUESTS must be positive integer")?;
+                }
                 "CASKET_RETURN_STACKTRACE_IN_BODY" => {
                     const ERR_STR: &str = "CASKET_RETURN_STACKTRACE_IN_BODY must be 0 or 1";
 

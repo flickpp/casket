@@ -62,7 +62,7 @@ impl WritingStream {
             self.buffer.truncate(bytes_remaining);
         }
 
-        match bytes_written_res {
+        match bytes_written_res.and_then(|_| tcp_stream.flush()) {
             Err(err) => Err(WriteError::Io((err, self.http_resp))),
             Ok(_) => {
                 if self.buffer.is_empty() && self.http_resp.resp_body.is_none() {

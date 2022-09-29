@@ -21,18 +21,6 @@ use readingstream::{ReadError, ReadState, ReadingStream};
 mod writingstream;
 use writingstream::{WriteError, WriteState, WritingStream};
 
-/*
-lazy_static! {
-    static ref TOO_BUSY_RESP: HttpResponse = HttpResponse {
-        code: 503,
-        reason: "Service Busy".to_string(),
-        headers: vec![],
-        context: Context::new(),
-        keep_alive: false,
-    };
-}
-*/
-
 #[derive(Default)]
 struct TcpStreams {
     // Streams registered for reading
@@ -173,7 +161,7 @@ pub fn run_worker(
             }
 
             if ev.is_writable() {
-                // Write from TcpStream
+                // Write to TcpStream
                 let (tcp_stream, writing_stream) = tcp_streams
                     .writing_streams
                     .remove(&ev.token())
@@ -274,7 +262,13 @@ fn handle_action(
                 .reading_streams
                 .insert(tk, (tcp_stream, ReadingStream::empty()));
         }
-        Action::ContinueReadStream((tk, tcp_stream, reading_stream)) => {
+        Action::ContinueReadStream((tk, mut tcp_stream, reading_stream)) => {
+            // Read again
+            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::READABLE) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
+
             tcp_streams
                 .reading_streams
                 .insert(tk, (tcp_stream, reading_stream));
@@ -297,7 +291,13 @@ fn handle_action(
                 .writing_streams
                 .insert(tk, (tcp_stream, WritingStream::new(http_resp, buffer)));
         }
-        Action::ContinueWriteStream((tk, tcp_stream, writing_stream)) => {
+        Action::ContinueWriteStream((tk, mut tcp_stream, writing_stream)) => {
+            // We need to register to write again
+            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::WRITABLE) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
+
             tcp_streams
                 .writing_streams
                 .insert(tk, (tcp_stream, writing_stream));
@@ -337,26 +337,23 @@ fn handle_action(
                 http_too_busy_reqs.push(*http_req);
             }
         }
-        _ => {} /*
-                    Action::NewBusyStream(http_req) => {
-                        let (tk, mut tcp_stream) = tcp_streams
-                            .too_busy_streams
-                            .pop_front()
-                            .expect("too busy streams deque empty");
+        Action::NewBusyStream(http_req) => {
+            let (tk, mut tcp_stream) = tcp_streams
+                .too_busy_streams
+                .pop_front()
+                .expect("too busy streams deque empty");
 
-                        let (_, bod_recv) = channel();
-                        let writing_stream = WritingStream::new(too_busy_resp(http_req), boyd_recv);
+            let writing_stream = WritingStream::new(too_busy_resp(http_req), vec![0; 512]);
 
-                        if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::WRITABLE) {
-                            msg_buffer.resp_stream_reg_error(tk, e);
-                            return;
-                        }
+            if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::WRITABLE) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
 
-                        tcp_streams
-                            .writing_streams
-                            .insert(tk, (tcp_stream, writing_stream));
-                }
-                    */
+            tcp_streams
+                .writing_streams
+                .insert(tk, (tcp_stream, writing_stream));
+        }
     }
 }
 
@@ -400,10 +397,18 @@ fn handle_try_recv_processing_stream(
     }
 }
 
-/*
-fn too_busy_resp(http_req: Box<HttpRequest>) -> HttpResponse {
-    let mut resp = TOO_BUSY_RESP.clone();
-    resp.context = http_req.context;
-    resp
+fn too_busy_resp(http_req: Box<HttpRequest>) -> Box<HttpResponse> {
+    Box::new(HttpResponse {
+        method: http_req.method,
+        url: http_req.url,
+        code: 503,
+        reason: String::from("Service Busy"),
+        context: http_req.context,
+        keep_alive: false,
+        req_headers: http_req.headers,
+        req_content_length: http_req.content_length,
+        resp_headers: vec![],
+        resp_content_length: Some(0),
+        resp_body: None,
+    })
 }
-*/
