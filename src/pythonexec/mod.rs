@@ -6,11 +6,13 @@ use std::thread::Builder as ThreadBuilder;
 use ndjsonlogger::error;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::config::Config;
 use crate::http::{HttpRequest, HttpResponse};
 use crate::workq;
 
+mod logger;
 mod reqlocal;
 mod wsgi;
 
@@ -120,6 +122,22 @@ impl Application {
 
         let mod_name = parts[0];
         let func_name = parts[1];
+
+        Python::with_gil(|py| -> PyResult<()> {
+            let sys = PyModule::import(py, "sys")?;
+            let py_modules: &PyDict = sys.getattr("modules")?.downcast()?;
+
+            let casket = PyModule::new(py, "casket")?;
+            py_modules.set_item("casket", casket)?;
+            let logger = PyModule::new(py, "logger")?;
+            logger.add_function(wrap_pyfunction!(logger::info, logger)?)?;
+            logger.add_function(wrap_pyfunction!(logger::warn, logger)?)?;
+            logger.add_function(wrap_pyfunction!(logger::error, logger)?)?;
+
+            casket.add_submodule(logger)?;
+
+            Ok(())
+        })?;
 
         Python::with_gil(|py| load_application(py, mod_name, func_name))
             .map(|wsgi_callable| Self { wsgi_callable })

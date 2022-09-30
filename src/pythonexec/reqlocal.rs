@@ -11,6 +11,10 @@ pub fn set_context(ctx: Context) {
     CONTEXT.with(|c| *(c.borrow_mut()) = Some(ctx));
 }
 
+pub fn get_context() -> Option<Context> {
+    CONTEXT.with(|c| c.borrow().clone())
+}
+
 pub fn init_req_thread() {
     CONTEXT.with(|c| *(c.borrow_mut()) = None);
     RESPONSE_HEADER.with(|r| *(r.borrow_mut()) = None);

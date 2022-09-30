@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 ndjsonlogger = "0.1.0"
-ndjsonloggercore = {version = "0.1.0", features = ["isotimestamp", "std"]}
+ndjsonloggercore = { features = ["isotimestamp", "std"], git = "https://github.com/flickpp/ndjsonloggercore", rev = "a07c141ed4f462c0728fe1308ffb6ca30fe8ad81" }
 fd-queue = {git = "https://github.com/flickpp/fd-queue.git", rev = "d076627ccc24eaaf49b06113c46b5ef2abf37a16", features = ["mio", "mio-fd"]}
 libc = "0.2.133"
 mio = {version = "0.8.4", features = ["net", "os-ext", "os-poll"]}

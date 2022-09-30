@@ -37,6 +37,13 @@ We do not currently release binaries.
 
 Source code with instructions for building are avaliable in the `repo <https://github.com/flickpp/casket>`_.
 
+
+Tutorials
+=============
+
+.. toctree::
+   tut-logging.rst
+
 Releases
 ============
 
