@@ -62,3 +62,29 @@ Consider this example.
 
 Running this example code will produce a log line containing the additional three keys.
 We also note that the JSON serializer supports True/False and numbers from Python.
+
+Piping (tips)
+~~~~~~~~~~~~~~~
+
+Casket *always* logs to stdout, with one log message per line.
+This makes processing the stream simple with pipes.
+
+The below example will only print log lines containing an error to your terminal.
+
+.. code-block::
+
+   $ casket service:app | grep error
+
+
+Logging to a file is likewise trivial.
+
+.. code-block::
+
+   $ casket service:app > logfile
+
+
+Searching this file is also simple - a common thing to do is grep for a trace_id.
+
+.. code-block::
+
+   $ grep 08f96edbf143fd5f0c5b52d649c2ffa3 logfile
