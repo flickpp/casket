@@ -14,6 +14,7 @@ pub enum ReadError {
 pub enum ReadState {
     Partial(ReadingStream),
     Complete(Box<HttpRequest>),
+    StreamEOF,
 }
 
 enum InnerState {
@@ -41,9 +42,15 @@ impl ReadingStream {
                     buffer.resize(buffer.len() + 4096, 0);
                 }
 
-                buf_len += tcp_stream
+                let bytes_read = tcp_stream
                     .read(&mut buffer[buf_len..])
                     .map_err(ReadError::Io)?;
+
+                if bytes_read == 0 {
+                    return Ok(ReadState::StreamEOF);
+                }
+
+                buf_len += bytes_read;
 
                 // Parse the header
                 let mut headers = [httparse::EMPTY_HEADER; 16];
