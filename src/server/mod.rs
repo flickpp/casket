@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 use std::time;
@@ -6,15 +7,13 @@ use std::time;
 use fd_queue::mio::UnixStream;
 use libc::pid_t;
 use mio::{net::TcpListener, net::TcpStream, Events, Interest, Poll, Token};
-use ndjsonlogger::{debug, warn};
+use ndjsonlogger::{debug, info, warn};
 
 use crate::config::Config;
 use crate::errors::{fatal_io_error, RuntimeError, RuntimeResult};
 
 mod unixstreams;
 use unixstreams::{UnixStream as ServerUnixStream, UnixStreams as ServerUnixStreams};
-mod shutdown;
-use shutdown::{shutdown_loop, ShutdownData};
 
 pub fn run_server(
     cfg: Arc<Config>,
@@ -120,11 +119,7 @@ pub fn run_server(
 
         // Check we're running
         if (poll_res.is_err() || !running.load(Ordering::SeqCst)) && !run_shutdown {
-            errors.extend(shutdown_loop(ShutdownData {
-                listener: &mut listener,
-                reading_streams: &mut reading_streams,
-                poll: &poll,
-            }));
+            errors.extend(shutdown(&mut listener, &mut reading_streams, &poll));
 
             ctrlc_instant = Some(time::SystemTime::now());
             run_shutdown = true;
@@ -192,4 +187,33 @@ pub fn run_server(
             debug!("i/o error in loop", { error = &format!("{}", _err) });
         }
     }
+}
+
+fn shutdown(
+    listener: &mut TcpListener,
+    reading_streams: &mut HashMap<Token, TcpStream>,
+    poll: &Poll,
+) -> Vec<io::Error> {
+    info!("casket is shutting down");
+
+    let mut io_errs = vec![];
+
+    // Deregister the listener
+    if let Err(e) = poll.registry().deregister(listener) {
+        io_errs.push(e);
+    }
+
+    // shutdown all idle tcp streams
+    for (_, mut stream) in reading_streams.drain() {
+        let res = poll
+            .registry()
+            .deregister(&mut stream)
+            .and_then(|_| stream.shutdown(std::net::Shutdown::Both));
+
+        if let Err(e) = res {
+            io_errs.push(e);
+        }
+    }
+
+    io_errs
 }
