@@ -16,6 +16,7 @@ pub struct Config {
     pub body_stacktrace: bool,
     pub log_response: bool,
     pub ctrlc_wait_time: time::Duration,
+    pub request_read_timeout: time::Duration,
     pub version: (usize, usize),
 }
 
@@ -36,6 +37,7 @@ impl Default for Config {
             body_stacktrace: true,
             log_response: true,
             ctrlc_wait_time: time::Duration::from_secs(10),
+            request_read_timeout: time::Duration::from_secs(30),
             version: VERSION,
         }
     }
@@ -112,6 +114,14 @@ impl Config {
                     const ERR_STR: &str = "CASKET_CTRLC_WAIT_TIME must be a positive integer";
 
                     slf.ctrlc_wait_time = value
+                        .parse::<u64>()
+                        .map_err(|_| ERR_STR)
+                        .map(time::Duration::from_secs)?;
+                }
+                "CASKET_REQUEST_READ_TIMEOUT" => {
+                    const ERR_STR: &str = "CASKET_CTRLC_READ_TIMEOUT must be a positive integer";
+
+                    slf.request_read_timeout = value
                         .parse::<u64>()
                         .map_err(|_| ERR_STR)
                         .map(time::Duration::from_secs)?;

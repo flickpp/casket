@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::prelude::RawFd;
 use std::result;
@@ -20,17 +21,28 @@ mod readingstream;
 use readingstream::{ReadError, ReadState, ReadingStream};
 mod writingstream;
 use writingstream::{WriteError, WriteState, WritingStream};
+mod timersq;
+
+const HTTP_408_RESPONSE: &[u8] = include_bytes!("http408");
+
+const POLL_TIME: time::Duration = time::Duration::from_millis(20);
 
 #[derive(Default)]
 struct TcpStreams {
     // Streams registered for reading
     reading_streams: HashMap<Token, (TcpStream, ReadingStream)>,
 
+    // Timeouts for reading_streams
+    reading_streams_timeouts: timersq::TimersQ,
+
     // Streams, whose data is currently being processed in Python threads
     processing_streams: HashMap<Token, TcpStream>,
 
     // Streams on which we will return worker too busy
     too_busy_streams: VecDeque<(Token, TcpStream)>,
+
+    // Streams on which we return 408 Request timeout
+    request_timeout_streams: HashMap<Token, (TcpStream, usize)>,
 
     // Streams registered for writing
     writing_streams: HashMap<Token, (TcpStream, WritingStream)>,
@@ -55,12 +67,16 @@ enum Action {
     NewProcessStream((Token, TcpStream, Box<HttpRequest>)),
     NewBusyStream(Box<HttpRequest>),
     StreamEOF((Token, TcpStream)),
+    ReadTimeout(Token),
+    ContinueWriteReqTimeout((Token, TcpStream, usize)),
+    DoneWriteReqTimeout((Token, TcpStream)),
 }
 
 enum Error {
     PythonThreadsDied,
     Read((Token, TcpStream, ReadError)),
     Write((Token, TcpStream, WriteError)),
+    WriteTimeout((Token, TcpStream, io::Error)),
 }
 
 type Result = result::Result<Action, Error>;
@@ -96,6 +112,8 @@ pub fn run_worker(
     let mut ctrlc_instant: Option<time::SystemTime> = None;
 
     loop {
+        let loop_time = time::SystemTime::now();
+
         // Gracefully close after SIGINT
         if closing && tcp_streams.is_empty() && !msg_buffer.has_data_to_send() {
             break Ok(());
@@ -103,13 +121,8 @@ pub fn run_worker(
 
         // Close due to CTRLC_WAIT_TIME expiring
         if let Some(instant) = ctrlc_instant {
-            match instant.elapsed() {
-                Err(_) => break Ok(()),
-                Ok(duration) => {
-                    if duration > cfg.ctrlc_wait_time {
-                        break Ok(());
-                    }
-                }
+            if loop_time >= instant + cfg.ctrlc_wait_time {
+                break Ok(());
             }
         }
 
@@ -146,13 +159,31 @@ pub fn run_worker(
             results.push(Ok(Action::NewBusyStream(Box::new(busy_req))));
         }
 
-        let timeout = if !tcp_streams.processing_streams.is_empty() {
+        if !tcp_streams.processing_streams.is_empty() {
             // If we have processing streams (i.e reqs in python threads)
             // then don't block forever on poll. Furthermore call try_recv
             // on response queue.
             results.push(handle_try_recv_processing_stream(resp_recv.try_recv()));
-            Some(time::Duration::from_millis(20))
+        }
+
+        // compute the poll timeout
+        let timeout = if !tcp_streams.processing_streams.is_empty() {
+            // If we have processing need to poll the channel
+            Some(POLL_TIME)
+        } else if let Some((_, read_timeout)) = tcp_streams.reading_streams_timeouts.peek() {
+            // If we have active reads (and therefore timeouts)
+            match read_timeout.duration_since(loop_time) {
+                Ok(d) => {
+                    if d < POLL_TIME {
+                        Some(POLL_TIME)
+                    } else {
+                        Some(d)
+                    }
+                }
+                Err(_) => Some(POLL_TIME),
+            }
         } else {
+            // Nothing active, block poll forever
             None
         };
 
@@ -195,17 +226,36 @@ pub fn run_worker(
                     .expect("couldn't find reading stream");
 
                 results.push(handle_read_stream(ev.token(), tcp_stream, reading_stream));
+
+                continue;
             }
 
             if ev.is_writable() {
                 // Write to TcpStream
-                let (tcp_stream, writing_stream) = tcp_streams
-                    .writing_streams
-                    .remove(&ev.token())
-                    .expect("couldn't find reading stream");
+                if let Some((tcp_stream, writing_stream)) =
+                    tcp_streams.writing_streams.remove(&ev.token())
+                {
+                    results.push(handle_write_stream(ev.token(), tcp_stream, writing_stream));
+                }
 
-                results.push(handle_write_stream(ev.token(), tcp_stream, writing_stream));
+                if let Some((tcp_stream, bytes_written)) =
+                    tcp_streams.request_timeout_streams.remove(&ev.token())
+                {
+                    results.push(handle_write_request_timeout(
+                        ev.token(),
+                        tcp_stream,
+                        bytes_written,
+                    ));
+                }
+
+                continue;
             }
+        }
+
+        // Examine our read timeouts
+        let now = time::SystemTime::now();
+        while let Some((tk, _)) = tcp_streams.reading_streams_timeouts.next_timeout(now) {
+            results.push(Ok(Action::ReadTimeout(tk)));
         }
 
         for res in results.drain(..) {
@@ -275,6 +325,11 @@ fn handle_error(
                 Ok(())
             }
         },
+        Error::WriteTimeout((tk, mut tcp_stream, io_err)) => {
+            registry.deregister(&mut tcp_stream).unwrap_or(());
+            msg_buffer.resp_io_error(tk, io_err);
+            Ok(())
+        }
     }
 }
 
@@ -298,6 +353,10 @@ fn handle_action(
             tcp_streams
                 .reading_streams
                 .insert(tk, (tcp_stream, ReadingStream::empty()));
+
+            // Begin the timeout
+            let timeout = time::SystemTime::now() + cfg.request_read_timeout;
+            tcp_streams.reading_streams_timeouts.push_back(tk, timeout);
         }
         Action::ContinueReadStream((tk, mut tcp_stream, reading_stream)) => {
             // Read again
@@ -399,6 +458,68 @@ fn handle_action(
 
             msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
         }
+        Action::ReadTimeout(tk) => {
+            let (mut tcp_stream, _) = match tcp_streams.reading_streams.remove(&tk) {
+                Some(t) => t,
+                None => return,
+            };
+
+            // Register the stream for writing
+            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::WRITABLE) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            tcp_streams
+                .request_timeout_streams
+                .insert(tk, (tcp_stream, 0));
+        }
+        Action::ContinueWriteReqTimeout((tk, mut tcp_stream, bytes_remaining)) => {
+            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::WRITABLE) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            tcp_streams
+                .request_timeout_streams
+                .insert(tk, (tcp_stream, bytes_remaining));
+        }
+        Action::DoneWriteReqTimeout((tk, mut tcp_stream)) => {
+            if let Err(e) = registry.deregister(&mut tcp_stream) {
+                msg_buffer.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            info!("request read timeout", { "http.status_code": u16 = 408 });
+
+            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
+        }
+    }
+}
+
+fn handle_write_request_timeout(
+    tk: Token,
+    mut tcp_stream: TcpStream,
+    mut bytes_written: usize,
+) -> Result {
+    let to_write = &HTTP_408_RESPONSE[bytes_written..];
+
+    match tcp_stream.write(to_write) {
+        Ok(num_bytes) => {
+            bytes_written += num_bytes;
+            let bytes_remaining = HTTP_408_RESPONSE.len() - bytes_written;
+            if bytes_remaining > 0 {
+                // This function needs to be called again
+                Ok(Action::ContinueWriteReqTimeout((
+                    tk,
+                    tcp_stream,
+                    bytes_remaining,
+                )))
+            } else {
+                Ok(Action::DoneWriteReqTimeout((tk, tcp_stream)))
+            }
+        }
+        Err(e) => Err(Error::WriteTimeout((tk, tcp_stream, e))),
     }
 }
 

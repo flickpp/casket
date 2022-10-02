@@ -59,7 +59,8 @@ Example:
 ``CASKET_MAX_REQUESTS=8``
 
 
-CASKET_RETURN_STACKTRACE_IN_BODY
+CASKET_RE
+TURN_STACKTRACE_IN_BODY
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. admonition:: NOTE
@@ -187,3 +188,20 @@ Casket will exit anyway. The value is given in seconds.
 Example:
 
 ``CASKET_CTRLC_WAIT_TIME=25``
+
+
+.. _config-request-read-timeout:
+
+CASKET_REQUEST_READ_TIMEOUT
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``DEFAULT: 30``
+
+The number of seconds to wait for a request to arrive after we start
+reading. This includes *both* header and body.
+
+See :ref:`status-codes-408`.
+
+Example:
+
+``CASKET_REQUEST_READ_TIMEOUT=25``
