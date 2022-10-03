@@ -65,7 +65,7 @@ impl ReadingStream {
                     Ok(httparse::Status::Complete(header_size)) => {
                         let mut partial_http_req = PartialHttpReq::new(request)?;
                         buffer.truncate(buf_len);
-                        partial_http_req.take_body(buffer, header_size);
+                        partial_http_req.take_body(buffer, header_size)?;
 
                         if partial_http_req.is_done() {
                             Ok(ReadState::Complete(Box::new(partial_http_req.into())))
@@ -180,11 +180,18 @@ impl PartialHttpReq {
         })
     }
 
-    fn take_body(&mut self, buffer: Vec<u8>, header_size: usize) {
+    fn take_body(&mut self, buffer: Vec<u8>, header_size: usize) -> result::Result<(), ReadError> {
+        if buffer[header_size..].len() > self.content_length {
+            // Too many bytes in buffer
+            return Err(ReadError::BadValue("content-length too large"));
+        }
+
         self.body.reserve(self.content_length);
         self.body.extend(&buffer[header_size..]);
         self.body.resize(self.content_length, 0);
         self.bytes_read = buffer.len() - header_size;
+
+        Ok(())
     }
 
     fn read_tcp_stream(&mut self, tcp_stream: &mut TcpStream) -> result::Result<(), ReadError> {
