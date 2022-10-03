@@ -59,8 +59,7 @@ Example:
 ``CASKET_MAX_REQUESTS=8``
 
 
-CASKET_RE
-TURN_STACKTRACE_IN_BODY
+CASKET_RETURN_STACKTRACE_IN_BODY
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. admonition:: NOTE

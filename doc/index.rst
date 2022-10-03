@@ -43,6 +43,7 @@ Tutorials
 
 .. toctree::
    tut-logging.rst
+   tut-flask-docker.rst
 
 
 Modules

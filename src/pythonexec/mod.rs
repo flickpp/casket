@@ -130,7 +130,6 @@ impl Application {
             let casket = PyModule::new(py, "casket")?;
             py_modules.set_item("casket", casket)?;
             let logger = PyModule::new(py, "logger")?;
-            logger.add_function(wrap_pyfunction!(logger::debug, logger)?)?;
             logger.add_function(wrap_pyfunction!(logger::info, logger)?)?;
             logger.add_function(wrap_pyfunction!(logger::warn, logger)?)?;
             logger.add_function(wrap_pyfunction!(logger::error, logger)?)?;

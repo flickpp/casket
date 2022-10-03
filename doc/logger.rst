@@ -3,7 +3,7 @@ Logger
 
 .. code-block:: python
 
-   from casket.logger import debug, info, warn, error
+   from casket.logger import info, warn, error
 
 
 This module contains four function (see above).

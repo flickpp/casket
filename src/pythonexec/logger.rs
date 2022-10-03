@@ -6,12 +6,6 @@ use pyo3::types::{PyBool, PyDict, PyString};
 use super::reqlocal;
 
 #[pyfunction(tags = "None")]
-pub fn debug(py: Python, msg: &str, mut tags: Option<&PyDict>) -> PyResult<()> {
-    let dict = tags.take().unwrap_or_else(|| PyDict::new(py));
-    log(Level::Debug, msg, dict)
-}
-
-#[pyfunction(tags = "None")]
 pub fn info(py: Python, msg: &str, mut tags: Option<&PyDict>) -> PyResult<()> {
     let dict = tags.take().unwrap_or_else(|| PyDict::new(py));
     log(Level::Info, msg, dict)
