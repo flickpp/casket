@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::result;
 use std::time;
 
-const VERSION: (usize, usize) = (0, 1);
+const VERSION: (usize, usize) = (0, 2);
 
 pub struct Config {
     pub num_workers: usize,
