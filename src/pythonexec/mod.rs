@@ -2,6 +2,7 @@ use std::fs;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::Builder as ThreadBuilder;
+use std::time;
 
 use ndjsonlogger::error;
 use pyo3::exceptions::PyRuntimeError;
@@ -22,13 +23,15 @@ pub struct Application {
 
 type RequestSender = workq::Sender<(usize, HttpRequest)>;
 type ResponseReceiver = Receiver<(usize, HttpResponse)>;
+type CodeStartReceiver = Receiver<(usize, time::SystemTime)>;
 
 pub fn spawn(
     cfg: Arc<Config>,
     application: Application,
     server: (String, u16),
-) -> (RequestSender, ResponseReceiver) {
+) -> (RequestSender, CodeStartReceiver, ResponseReceiver) {
     let (resp_send, resp_recv) = channel();
+    let (code_start_send, code_start_recv) = channel();
     let mut req_send = workq::new();
 
     for n in 0..cfg.num_threads {
@@ -37,14 +40,24 @@ pub fn spawn(
         let wsgi_callable = Python::with_gil(|py| application.wsgi_callable.clone_ref(py));
         let req_recv = req_send.new_recv();
         let cfg = cfg.clone();
+        let code_start_send = code_start_send.clone();
 
         ThreadBuilder::new()
             .name(format!("python-{}", n))
-            .spawn(move || run(cfg, req_recv, resp_send, server, wsgi_callable))
+            .spawn(move || {
+                run(
+                    cfg,
+                    req_recv,
+                    code_start_send,
+                    resp_send,
+                    server,
+                    wsgi_callable,
+                )
+            })
             .expect("couldn't spawn thread");
     }
 
-    (req_send, resp_recv)
+    (req_send, code_start_recv, resp_recv)
 }
 
 enum RespBody {
@@ -55,6 +68,7 @@ enum RespBody {
 fn run(
     cfg: Arc<Config>,
     req_recv: workq::Receiver<(usize, HttpRequest)>,
+    code_start_send: Sender<(usize, time::SystemTime)>,
     resp_send: Sender<(usize, HttpResponse)>,
     server: (String, u16),
     wsgi_callable: PyObject,
@@ -64,6 +78,14 @@ fn run(
         reqlocal::set_context(http_req.context.clone());
 
         let (body_send, body) = channel();
+
+        if code_start_send
+            .send((key, time::SystemTime::now()))
+            .is_err()
+        {
+            // Main thread has died
+            return;
+        }
 
         let (resp_header, resp_body) = match wsgi::execute(&wsgi_callable, &server, &mut http_req) {
             Ok((resp_header, bytes_iter)) => (resp_header, RespBody::PyIterator(bytes_iter)),

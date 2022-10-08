@@ -17,6 +17,7 @@ pub struct Config {
     pub log_response: bool,
     pub ctrlc_wait_time: time::Duration,
     pub request_read_timeout: time::Duration,
+    pub python_code_timeout: time::Duration,
     pub version: (usize, usize),
 }
 
@@ -32,12 +33,13 @@ impl Default for Config {
             num_threads: 2,
             bind_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 8080)),
             hostname,
-            max_conns: 128,
-            max_requests: 12,
+            max_conns: 256,
+            max_requests: 64,
             body_stacktrace: true,
             log_response: true,
             ctrlc_wait_time: time::Duration::from_secs(10),
             request_read_timeout: time::Duration::from_secs(30),
+            python_code_timeout: time::Duration::from_secs(10),
             version: VERSION,
         }
     }
@@ -122,6 +124,15 @@ impl Config {
                     const ERR_STR: &str = "CASKET_CTRLC_READ_TIMEOUT must be a positive integer";
 
                     slf.request_read_timeout = value
+                        .parse::<u64>()
+                        .map_err(|_| ERR_STR)
+                        .map(time::Duration::from_secs)?;
+                }
+                "CASKET_PYTHON_CODE_GATEWAY_TIMEOUT" => {
+                    const ERR_STR: &str =
+                        "CASKET_PYTHON_CODE_GATEWAY_TIMEOUT must be a positive integer";
+
+                    slf.python_code_timeout = value
                         .parse::<u64>()
                         .map_err(|_| ERR_STR)
                         .map(time::Duration::from_secs)?;

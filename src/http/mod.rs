@@ -1,6 +1,13 @@
+use std::io;
 use std::sync::mpsc::Receiver;
 
 use random_fast_rng::{FastRng, Random};
+
+pub enum HttpError {
+    Io((&'static str, io::Error)),
+    HeaderParse(httparse::Error),
+    BadValue(&'static str),
+}
 
 pub struct HttpRequest {
     pub method: http_types::Method,

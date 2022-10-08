@@ -1,582 +1,509 @@
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
-use std::os::unix::io::{FromRawFd, IntoRawFd};
-use std::os::unix::prelude::RawFd;
-use std::result;
-use std::sync::mpsc::TryRecvError;
-use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
+use std::collections::HashMap;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::IntoRawFd;
+use std::sync::Arc;
 use std::time;
 
 use fd_queue::mio::UnixStream;
-use mio::{net::TcpStream, Events, Interest, Poll, Registry, Token};
+use mio::{net::TcpStream, Token};
 use ndjsonlogger::info;
 
 use crate::config::Config;
-use crate::errors::{fatal_io_error, RuntimeError, RuntimeResult};
-use crate::http::{HttpRequest, HttpResponse};
+use crate::errors::{fatal_io_error, RuntimeResult};
+use crate::http::HttpError;
 use crate::msgs;
 use crate::pythonexec;
 
-mod readingstream;
-use readingstream::{ReadError, ReadState, ReadingStream};
-mod writingstream;
-use writingstream::{WriteError, WriteState, WritingStream};
-mod timersq;
+mod actions;
+use actions::{
+    new_408_timeout, new_503_service_busy, new_504_gateway_timeout, Action, ActionResult,
+    CasketResponse, Error as ActionError, ErrorSource,
+};
+mod events;
+mod poller;
+mod pythonthreads;
+mod serverreader;
+mod serverwriter;
 
-const HTTP_408_RESPONSE: &[u8] = include_bytes!("http408");
-
+const UNIX_STREAM_TOKEN: Token = Token(0);
+const NO_TOKEN: Token = Token(1);
 const POLL_TIME: time::Duration = time::Duration::from_millis(20);
 
-#[derive(Default)]
-struct TcpStreams {
-    // Streams registered for reading
-    reading_streams: HashMap<Token, (TcpStream, ReadingStream)>,
+struct Worker {
+    msg_buf: msgs::WorkerMsgBuffer,
+    poll: poller::Poller,
+    python_threads: pythonthreads::PythonThreads,
 
-    // Timeouts for reading_streams
-    reading_streams_timeouts: timersq::TimersQ,
-
-    // Streams, whose data is currently being processed in Python threads
-    processing_streams: HashMap<Token, TcpStream>,
-
-    // Streams on which we will return worker too busy
-    too_busy_streams: VecDeque<(Token, TcpStream)>,
-
-    // Streams on which we return 408 Request timeout
-    request_timeout_streams: HashMap<Token, (TcpStream, usize)>,
-
-    // Streams registered for writing
-    writing_streams: HashMap<Token, (TcpStream, WritingStream)>,
+    server_reading_streams: HashMap<Token, (TcpStream, serverreader::Reader)>,
+    server_pending_streams: HashMap<Token, TcpStream>,
+    server_writing_streams: HashMap<Token, (TcpStream, serverwriter::Writer)>,
+    server_casket_responses: HashMap<Token, (TcpStream, CasketResponse)>,
 }
-
-impl TcpStreams {
-    fn is_empty(&self) -> bool {
-        self.reading_streams.is_empty()
-            && self.processing_streams.is_empty()
-            && self.too_busy_streams.is_empty()
-            && self.writing_streams.is_empty()
-    }
-}
-
-enum Action {
-    None,
-    NewReadStream((Token, TcpStream)),
-    ContinueReadStream((Token, TcpStream, ReadingStream)),
-    NewWriteStream((usize, Box<HttpResponse>)),
-    ContinueWriteStream((Token, TcpStream, WritingStream)),
-    DoneWriteStream((Token, TcpStream, Box<HttpResponse>)),
-    NewProcessStream((Token, TcpStream, Box<HttpRequest>)),
-    NewBusyStream(Box<HttpRequest>),
-    StreamEOF((Token, TcpStream)),
-    ReadTimeout(Token),
-    ContinueWriteReqTimeout((Token, TcpStream, usize)),
-    DoneWriteReqTimeout((Token, TcpStream)),
-}
-
-enum Error {
-    PythonThreadsDied,
-    Read((Token, TcpStream, ReadError)),
-    Write((Token, TcpStream, WriteError)),
-    WriteTimeout((Token, TcpStream, io::Error)),
-}
-
-type Result = result::Result<Action, Error>;
 
 pub fn run_worker(
     cfg: Arc<Config>,
-    running: Arc<AtomicBool>,
-    close_now: Arc<AtomicBool>,
     application: pythonexec::Application,
-    mut stream: UnixStream,
+    mut unix_stream: UnixStream,
 ) -> RuntimeResult {
-    // Spawn Python threads
-    let server = (cfg.hostname.clone(), cfg.port());
-    let (mut req_send, resp_recv) = pythonexec::spawn(cfg.clone(), application, server);
+    let mut poll = poller::Poller::new()
+        .map_err(|e| fatal_io_error("worker couldn't create poll instance", e))?;
 
-    let mut poll = Poll::new().map_err(|e| fatal_io_error("couldn't create poll instance", e))?;
-    let mut events = Events::with_capacity(64);
+    poll.register_read(
+        &mut unix_stream,
+        UNIX_STREAM_TOKEN,
+        events::Event::UnixStreamRead,
+    )
+    .map_err(|e| fatal_io_error("worker couldn't register unix stream for reading", e))?;
 
-    // Register our unix stream for communicating with server
-    const STREAM_TOKEN: Token = Token(0);
-    let mut unix_stream_interest = Interest::READABLE;
-    poll.registry()
-        .register(&mut stream, STREAM_TOKEN, unix_stream_interest)
-        .map_err(|e| fatal_io_error("couldn't register unix stream with mio in worker", e))?;
+    let mut worker = Worker {
+        msg_buf: msgs::WorkerMsgBuffer::new(),
+        poll,
+        python_threads: pythonthreads::PythonThreads::new(cfg.clone(), application),
 
-    let mut tcp_streams = TcpStreams::default();
-    let mut msg_buffer = msgs::WorkerMsgBuffer::new();
+        server_reading_streams: HashMap::new(),
+        server_pending_streams: HashMap::new(),
+        server_writing_streams: HashMap::new(),
+        server_casket_responses: HashMap::new(),
+    };
 
-    let mut results = Vec::with_capacity(64);
-    let mut http_reqs: Vec<(Token, HttpRequest)> = Vec::with_capacity(16);
-    let mut http_too_busy_reqs: Vec<HttpRequest> = Vec::with_capacity(16);
+    let mut events_buf = Vec::with_capacity(64);
+    let mut events_timeout_buf = Vec::with_capacity(64);
+    let mut worker_results = Vec::with_capacity(64);
     let mut closing = false;
-    let mut ctrlc_instant: Option<time::SystemTime> = None;
 
     loop {
-        let loop_time = time::SystemTime::now();
-
-        // Gracefully close after SIGINT
-        if closing && tcp_streams.is_empty() && !msg_buffer.has_data_to_send() {
+        if closing
+            && !worker.msg_buf.has_data_to_send()
+            && worker.python_threads.num_pending_reqs() == 0
+            && !worker.python_threads.has_queued_reqs()
+            && worker.server_writing_streams.is_empty()
+        {
             break Ok(());
         }
 
-        // Close due to CTRLC_WAIT_TIME expiring
-        if let Some(instant) = ctrlc_instant {
-            if loop_time >= instant + cfg.ctrlc_wait_time {
-                break Ok(());
-            }
+        while let Some((tk, fd)) = worker.msg_buf.next_stream_fd() {
+            events_buf.push((tk, events::Event::NewStreamFd(fd)));
         }
 
-        // Close now due to second SIGINT
-        if close_now.load(Ordering::SeqCst) {
-            break Ok(());
+        if worker.python_threads.num_pending_reqs() > 0 {
+            events_buf.push((NO_TOKEN, events::Event::PollPythonResponses));
         }
 
-        // If we have responses, make sure our unix stream is registered for writing
-        if msg_buffer.has_data_to_send() && !unix_stream_interest.is_writable() {
-            unix_stream_interest = Interest::READABLE | Interest::WRITABLE;
-            poll.registry()
-                .reregister(&mut stream, STREAM_TOKEN, unix_stream_interest)
-                .map_err(|err| fatal_io_error("couldn't reregister unix stream in worker", err))?;
+        if worker.python_threads.has_queued_reqs() {
+            events_buf.push((NO_TOKEN, events::Event::QueuedRequests));
         }
 
-        // If we don't have responses, make sure sure our unix stream is not registered for writing
-        if !msg_buffer.has_data_to_send() && unix_stream_interest.is_writable() {
-            unix_stream_interest = Interest::READABLE;
-            poll.registry()
-                .reregister(&mut stream, STREAM_TOKEN, unix_stream_interest)
-                .map_err(|err| fatal_io_error("couldn't reregister unix stream in worker", err))?;
-        }
-
-        // Send parsed requests to python threads
-        for (tk, req) in http_reqs.drain(..) {
-            if req_send.send((tk.0, req)).is_err() {
-                results.push(Err(Error::PythonThreadsDied));
-            }
-        }
-
-        // Handle parsed requests which we're too busy too deal with
-        for busy_req in http_too_busy_reqs.drain(..) {
-            results.push(Ok(Action::NewBusyStream(Box::new(busy_req))));
-        }
-
-        if !tcp_streams.processing_streams.is_empty() {
-            // If we have processing streams (i.e reqs in python threads)
-            // then don't block forever on poll. Furthermore call try_recv
-            // on response queue.
-            results.push(handle_try_recv_processing_stream(resp_recv.try_recv()));
-        }
-
-        // compute the poll timeout
-        let timeout = if !tcp_streams.processing_streams.is_empty() {
-            // If we have processing need to poll the channel
-            Some(POLL_TIME)
-        } else if let Some((_, read_timeout)) = tcp_streams.reading_streams_timeouts.peek() {
-            // If we have active reads (and therefore timeouts)
-            match read_timeout.duration_since(loop_time) {
-                Ok(d) => {
-                    if d < POLL_TIME {
-                        Some(POLL_TIME)
-                    } else {
-                        Some(d)
-                    }
-                }
-                Err(_) => Some(POLL_TIME),
-            }
-        } else {
-            // Nothing active, block poll forever
+        let timeout = if events_buf.is_empty() {
             None
+        } else {
+            Some(POLL_TIME)
         };
 
-        let poll_res = poll.poll(&mut events, timeout);
-        if poll_res.is_err() || !running.load(Ordering::SeqCst) {
-            closing = true;
-            ctrlc_instant = Some(time::SystemTime::now());
-        }
+        worker.poll.tick(&mut events_buf, timeout)?;
 
-        for ev in &events {
-            // Unix Stream
-            if ev.token() == STREAM_TOKEN {
-                if ev.is_readable() {
-                    // I/O errors on our unix stream are critical
-                    msg_buffer
-                        .read_unix_stream(&mut stream)
-                        .map_err(|e| fatal_io_error("read error on unix stream in worker", e))?;
+        for (tk, ev) in events_buf.drain(..) {
+            match ev {
+                events::Event::CtrlC => {
+                    closing = true;
+                }
+                events::Event::UnixStreamRead => {
+                    worker
+                        .msg_buf
+                        .read_unix_stream(&mut unix_stream)
+                        .map_err(|e| fatal_io_error("worker couldn't read unix stream", e))?;
+                }
+                events::Event::UnixStreamWrite => {
+                    worker
+                        .msg_buf
+                        .write_unix_stream(&mut unix_stream)
+                        .map_err(|e| fatal_io_error("worker couldn't read unix stream", e))?;
+                }
+                events::Event::NewStreamFd(fd) => {
+                    let tcp_stream = unsafe { TcpStream::from_raw_fd(fd) };
 
-                    while let Some((token, fd)) = msg_buffer.next_stream_fd() {
-                        results.push(handle_new_fd(token, fd));
+                    if worker.python_threads.num_pending_reqs() >= cfg.max_requests {
+                        worker_results.push(Ok(new_503_service_busy(tk, tcp_stream)));
+                    } else {
+                        worker_results.push(Ok(Action::NewServerRequest((tk, tcp_stream))));
                     }
                 }
+                events::Event::ServerStreamRead => {
+                    let (tcp_stream, reader) = worker
+                        .server_reading_streams
+                        .remove(&tk)
+                        .expect("couldn't find reading stream");
 
-                if ev.is_writable() {
-                    msg_buffer
-                        .write_unix_stream(&mut stream)
-                        .map_err(|e| fatal_io_error("write error on unix stream in worker", e))?;
+                    worker_results.push(event_server_stream_read(tk, tcp_stream, reader));
                 }
-
-                // Next event
-                continue;
-            }
-
-            // TcpStreams
-            if ev.is_readable() {
-                // Read from TcpStream
-                let (tcp_stream, reading_stream) = tcp_streams
-                    .reading_streams
-                    .remove(&ev.token())
-                    .expect("couldn't find reading stream");
-
-                results.push(handle_read_stream(ev.token(), tcp_stream, reading_stream));
-
-                continue;
-            }
-
-            if ev.is_writable() {
-                // Write to TcpStream
-                if let Some((tcp_stream, writing_stream)) =
-                    tcp_streams.writing_streams.remove(&ev.token())
-                {
-                    results.push(handle_write_stream(ev.token(), tcp_stream, writing_stream));
+                events::Event::QueuedRequests => worker.python_threads.send_queued_requests()?,
+                events::Event::PollPythonResponses => {
+                    worker.python_threads.take_responses(&mut worker_results)?
                 }
+                events::Event::ServerStreamWrite => {
+                    let (tcp_stream, writer) = worker
+                        .server_writing_streams
+                        .remove(&tk)
+                        .expect("couldn't find writing stream");
 
-                if let Some((tcp_stream, bytes_written)) =
-                    tcp_streams.request_timeout_streams.remove(&ev.token())
-                {
-                    results.push(handle_write_request_timeout(
-                        ev.token(),
-                        tcp_stream,
-                        bytes_written,
-                    ));
+                    worker_results.push(event_server_stream_write(tk, tcp_stream, writer));
                 }
+                events::Event::RequestReadTimeout => {
+                    events_timeout_buf.push((tk, events::Timeout::RequestRead));
+                }
+                events::Event::CasketResponseWrite => {
+                    let (tcp_stream, casket_resp) = worker
+                        .server_casket_responses
+                        .remove(&tk)
+                        .expect("couldn't find request read timeout stream");
 
-                continue;
+                    worker_results.push(event_casket_response_write(tk, tcp_stream, casket_resp));
+                }
+                events::Event::PythonCodeTimeout => {
+                    events_timeout_buf.push((tk, events::Timeout::PythonCode));
+                }
             }
         }
 
-        // Examine our read timeouts
-        let now = time::SystemTime::now();
-        while let Some((tk, _)) = tcp_streams.reading_streams_timeouts.next_timeout(now) {
-            results.push(Ok(Action::ReadTimeout(tk)));
-        }
-
-        for res in results.drain(..) {
+        // Action all non-timeout events
+        for res in worker_results.drain(..) {
             match res {
-                Ok(action) => handle_action(
-                    &cfg,
-                    action,
-                    poll.registry(),
-                    &mut tcp_streams,
-                    &mut http_reqs,
-                    &mut http_too_busy_reqs,
-                    &mut msg_buffer,
-                ),
-                Err(err) => {
-                    handle_error(&cfg, err, poll.registry(), &mut msg_buffer)?;
+                Ok(act) => handle_action(&cfg, &mut worker, act),
+                Err(e) => handle_error(&mut worker, e),
+            }
+        }
+
+        // Timeout events
+        for (tk, ev) in events_timeout_buf.drain(..) {
+            match ev {
+                events::Timeout::RequestRead => {
+                    if let Some((mut tcp_stream, _)) = worker.server_reading_streams.remove(&tk) {
+                        worker.poll.deregister(&mut tcp_stream).map_err(|e| {
+                            fatal_io_error("worker couldn't deregister stream poll", e)
+                        })?;
+                        worker_results.push(Ok(new_408_timeout(tk, tcp_stream)));
+                    }
+                }
+                events::Timeout::PythonCode => {
+                    if let Some(tcp_stream) = worker.server_pending_streams.remove(&tk) {
+                        worker.python_threads.timeout_request(tk);
+                        worker_results.push(Ok(new_504_gateway_timeout(tk, tcp_stream)));
+                    }
                 }
             }
+        }
+
+        // Timeout results
+        for res in worker_results.drain(..) {
+            match res {
+                Ok(act) => handle_action(&cfg, &mut worker, act),
+                Err(e) => handle_error(&mut worker, e),
+            }
+        }
+
+        // Put UnixStream in R or RW mode
+        if worker.msg_buf.has_data_to_send() {
+            worker
+                .poll
+                .reregister_rw(
+                    &mut unix_stream,
+                    UNIX_STREAM_TOKEN,
+                    events::Event::UnixStreamRead,
+                    events::Event::UnixStreamWrite,
+                )
+                .map_err(|e| fatal_io_error("worker failed to reregister unix stream", e))?;
+        } else {
+            worker
+                .poll
+                .reregister_read(
+                    &mut unix_stream,
+                    UNIX_STREAM_TOKEN,
+                    events::Event::UnixStreamRead,
+                )
+                .map_err(|e| fatal_io_error("worker failed to reregister unix stream", e))?;
         }
     }
 }
 
-fn handle_error(
-    cfg: &Config,
-    err: Error,
-    registry: &Registry,
-    msg_buffer: &mut msgs::WorkerMsgBuffer,
-) -> RuntimeResult {
-    match err {
-        Error::PythonThreadsDied => Err(RuntimeError::PythonThreadsDied),
-        Error::Read((tk, mut tcp_stream, read_error)) => {
-            let error = match read_error {
-                ReadError::Io(err) => {
-                    registry.deregister(&mut tcp_stream).unwrap_or(());
-                    msg_buffer.resp_io_error(tk, err);
-                    "i/o error reading tcp stream"
-                }
-                ReadError::Httparse(_) => {
-                    registry.deregister(&mut tcp_stream).unwrap_or(());
-                    msg_buffer.resp_bad_client(tk);
-                    "invalid http header"
-                }
-                ReadError::BadValue(err) => {
-                    registry.deregister(&mut tcp_stream).unwrap_or(());
-                    msg_buffer.resp_bad_client(tk);
-                    err
-                }
-            };
+fn handle_action(cfg: &Config, worker: &mut Worker, act: Action) {
+    use Action::*;
 
-            if cfg.log_response {
-                info!("failed to read http request", { error });
+    match act {
+        NewServerRequest((tk, mut tcp_stream)) => {
+            if let Err(e) =
+                worker
+                    .poll
+                    .register_read(&mut tcp_stream, tk, events::Event::ServerStreamRead)
+            {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
             }
 
-            Ok(())
+            let timeout = time::SystemTime::now() + cfg.request_read_timeout;
+
+            worker
+                .poll
+                .timer_event(tk, timeout, events::Event::RequestReadTimeout);
+
+            worker
+                .server_reading_streams
+                .insert(tk, (tcp_stream, serverreader::Reader::new()));
         }
-        Error::Write((tk, mut tcp_stream, write_error)) => match write_error {
-            WriteError::Io((err, http_resp)) => {
-                if cfg.log_response {
-                    info!("failed to write http response to tcp stream", {
-                        error                    = &format!("{}", err),
-                        trace_id                 = &http_resp.context.trace_id,
-                        span_id                  = &http_resp.context.span_id,
-                        parent_id: Option<&str>  = http_resp.context.parent_id_as_ref()
-                    });
-                }
-                registry.deregister(&mut tcp_stream).unwrap_or(());
-                msg_buffer.resp_io_error(tk, err);
-                Ok(())
+        ServerContinueRead((tk, reader, mut tcp_stream)) => {
+            if let Err(e) =
+                worker
+                    .poll
+                    .reregister_read(&mut tcp_stream, tk, events::Event::ServerStreamRead)
+            {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker
+                .server_reading_streams
+                .insert(tk, (tcp_stream, reader));
+        }
+        ServerReadDone((tk, http_req, mut tcp_stream)) => {
+            if let Err(e) = worker.poll.deregister(&mut tcp_stream) {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker.python_threads.queue_http_req(tk, http_req);
+            worker.server_pending_streams.insert(tk, tcp_stream);
+        }
+        ServerStreamEOF((tk, mut tcp_stream)) => {
+            if let Err(e) = worker.poll.deregister(&mut tcp_stream) {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker
+                .msg_buf
+                .resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
+        }
+        ServerNewResponse((tk, http_resp)) => {
+            let mut tcp_stream = worker
+                .server_pending_streams
+                .remove(&tk)
+                .expect("worker couldn't find pending stream");
+
+            if let Err(e) =
+                worker
+                    .poll
+                    .register_write(&mut tcp_stream, tk, events::Event::ServerStreamWrite)
+            {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker.server_writing_streams.insert(
+                tk,
+                (
+                    tcp_stream,
+                    serverwriter::Writer::new(http_resp, vec![0; 2048]),
+                ),
+            );
+        }
+        ServerContinueWrite((tk, writer, mut tcp_stream)) => {
+            if let Err(e) =
+                worker
+                    .poll
+                    .reregister_write(&mut tcp_stream, tk, events::Event::ServerStreamWrite)
+            {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker
+                .server_writing_streams
+                .insert(tk, (tcp_stream, writer));
+        }
+        ServerDoneWrite((tk, http_resp, mut tcp_stream)) => {
+            info!("sent HTTP response", {
+                "http.status_code": u16           = http_resp.code,
+                "http.method"                     = http_resp.method.as_ref(),
+                "http.url.path"                   = http_resp.url.path(),
+                "http.req_content_length" :usize  = http_resp.req_content_length,
+                "http.resp_content_length":usize  = http_resp.resp_content_length.unwrap_or(0),
+                trace_id                          = &http_resp.context.trace_id,
+                span_id                           = &http_resp.context.span_id,
+                parent_id: Option<&str>           = http_resp.context.parent_id_as_ref()
+            });
+
+            if let Err(e) = worker.poll.deregister(&mut tcp_stream) {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker
+                .msg_buf
+                .resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), http_resp.keep_alive);
+        }
+
+        ServerCasketResponseNew((tk, mut tcp_stream, casket_resp)) => {
+            if let Err(e) =
+                worker
+                    .poll
+                    .register_write(&mut tcp_stream, tk, events::Event::CasketResponseWrite)
+            {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker
+                .server_casket_responses
+                .insert(tk, (tcp_stream, casket_resp));
+        }
+
+        ServerCasketResponseContinue((tk, mut tcp_stream, casket_resp)) => {
+            if let Err(e) = worker.poll.reregister_write(
+                &mut tcp_stream,
+                tk,
+                events::Event::CasketResponseWrite,
+            ) {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            worker
+                .server_casket_responses
+                .insert(tk, (tcp_stream, casket_resp));
+        }
+        ServerCasketResponseDone((tk, mut tcp_stream, casket_resp)) => {
+            if let Err(e) = worker.poll.deregister(&mut tcp_stream) {
+                worker.msg_buf.resp_stream_reg_error(tk, e);
+                return;
+            }
+
+            info!("casket sent error http response", {
+                "http.status_code": u16 = casket_resp.code,
+                "reason" = casket_resp.reason
+            });
+
+            worker
+                .msg_buf
+                .resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
+        }
+
+        ServerPythonCodeTimeoutNew((tk, st)) => {
+            worker.poll.timer_event(
+                tk,
+                st + cfg.python_code_timeout,
+                events::Event::PythonCodeTimeout,
+            );
+        }
+    }
+}
+
+fn handle_error(worker: &mut Worker, mut error: actions::Error) {
+    // Logging
+    match error.error {
+        HttpError::Io((reason, ref err)) => {
+            info!("i/o failed on tcp stream", {
+                reason,
+                error = &format!("{}", err)
+            });
+        }
+        HttpError::HeaderParse(e) => {
+            info!("failed to parse http header", { error = &format!("{}", e) });
+        }
+        HttpError::BadValue(error) => {
+            info!("invalid http", { error });
+        }
+    }
+
+    if let Err(e) = worker.poll.deregister(&mut error.tcp_stream) {
+        worker.msg_buf.resp_stream_reg_error(error.token, e);
+        return;
+    }
+
+    match error.source {
+        ErrorSource::Server => match error.error {
+            HttpError::Io((_, err)) => worker.msg_buf.resp_io_error(error.token, err),
+
+            HttpError::HeaderParse(_) => {
+                // TODO: Send Bad request
+
+                worker.msg_buf.resp_bad_client(error.token);
+            }
+            HttpError::BadValue(_) => {
+                // TODO: Send Bad Request
+
+                worker.msg_buf.resp_bad_client(error.token);
             }
         },
-        Error::WriteTimeout((tk, mut tcp_stream, io_err)) => {
-            registry.deregister(&mut tcp_stream).unwrap_or(());
-            msg_buffer.resp_io_error(tk, io_err);
-            Ok(())
-        }
     }
 }
 
-fn handle_action(
-    cfg: &Config,
-    action: Action,
-    registry: &Registry,
-    tcp_streams: &mut TcpStreams,
-    http_reqs: &mut Vec<(Token, HttpRequest)>,
-    http_too_busy_reqs: &mut Vec<HttpRequest>,
-    msg_buffer: &mut msgs::WorkerMsgBuffer,
-) {
-    match action {
-        Action::None => {}
-        Action::NewReadStream((tk, mut tcp_stream)) => {
-            if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::READABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            tcp_streams
-                .reading_streams
-                .insert(tk, (tcp_stream, ReadingStream::empty()));
-
-            // Begin the timeout
-            let timeout = time::SystemTime::now() + cfg.request_read_timeout;
-            tcp_streams.reading_streams_timeouts.push_back(tk, timeout);
-        }
-        Action::ContinueReadStream((tk, mut tcp_stream, reading_stream)) => {
-            // Read again
-            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::READABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            tcp_streams
-                .reading_streams
-                .insert(tk, (tcp_stream, reading_stream));
-        }
-        Action::NewWriteStream((key, http_resp)) => {
-            let tk = Token(key);
-            let mut tcp_stream = tcp_streams
-                .processing_streams
-                .remove(&tk)
-                .expect("processing streams deque is empty");
-
-            if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::WRITABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            let buffer = vec![0; 4096];
-
-            tcp_streams
-                .writing_streams
-                .insert(tk, (tcp_stream, WritingStream::new(http_resp, buffer)));
-        }
-        Action::ContinueWriteStream((tk, mut tcp_stream, writing_stream)) => {
-            // We need to register to write again
-            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::WRITABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            tcp_streams
-                .writing_streams
-                .insert(tk, (tcp_stream, writing_stream));
-        }
-        Action::DoneWriteStream((tk, mut tcp_stream, http_resp)) => {
-            if cfg.log_response {
-                info!("request complete", {
-                    "http.status_code": u16           = http_resp.code,
-                    "http.method"                     = http_resp.method.as_ref(),
-                    "http.url.path"                   = http_resp.url.path(),
-                    "http.req_content_length" :usize  = http_resp.req_content_length,
-                    "http.resp_content_length":usize  = http_resp.resp_content_length.unwrap_or(0),
-                    trace_id                          = &http_resp.context.trace_id,
-                    span_id                           = &http_resp.context.span_id,
-                    parent_id: Option<&str>           = http_resp.context.parent_id_as_ref()
-                });
-            }
-
-            if let Err(e) = registry.deregister(&mut tcp_stream) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), http_resp.keep_alive);
-        }
-        Action::NewProcessStream((tk, mut tcp_stream, http_req)) => {
-            if let Err(e) = registry.deregister(&mut tcp_stream) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            if tcp_streams.processing_streams.len() < cfg.max_requests {
-                tcp_streams.processing_streams.insert(tk, tcp_stream);
-                http_reqs.push((tk, *http_req));
-            } else {
-                tcp_streams.too_busy_streams.push_back((tk, tcp_stream));
-                http_too_busy_reqs.push(*http_req);
-            }
-        }
-        Action::NewBusyStream(http_req) => {
-            let (tk, mut tcp_stream) = tcp_streams
-                .too_busy_streams
-                .pop_front()
-                .expect("too busy streams deque empty");
-
-            let writing_stream = WritingStream::new(too_busy_resp(http_req), vec![0; 512]);
-
-            if let Err(e) = registry.register(&mut tcp_stream, tk, Interest::WRITABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            tcp_streams
-                .writing_streams
-                .insert(tk, (tcp_stream, writing_stream));
-        }
-        Action::StreamEOF((tk, mut tcp_stream)) => {
-            if let Err(e) = registry.deregister(&mut tcp_stream) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
-        }
-        Action::ReadTimeout(tk) => {
-            let (mut tcp_stream, _) = match tcp_streams.reading_streams.remove(&tk) {
-                Some(t) => t,
-                None => return,
-            };
-
-            // Register the stream for writing
-            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::WRITABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            tcp_streams
-                .request_timeout_streams
-                .insert(tk, (tcp_stream, 0));
-        }
-        Action::ContinueWriteReqTimeout((tk, mut tcp_stream, bytes_remaining)) => {
-            if let Err(e) = registry.reregister(&mut tcp_stream, tk, Interest::WRITABLE) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            tcp_streams
-                .request_timeout_streams
-                .insert(tk, (tcp_stream, bytes_remaining));
-        }
-        Action::DoneWriteReqTimeout((tk, mut tcp_stream)) => {
-            if let Err(e) = registry.deregister(&mut tcp_stream) {
-                msg_buffer.resp_stream_reg_error(tk, e);
-                return;
-            }
-
-            info!("request read timeout", { "http.status_code": u16 = 408 });
-
-            msg_buffer.resp_stream_done_ok(tk, tcp_stream.into_raw_fd(), false);
-        }
-    }
-}
-
-fn handle_write_request_timeout(
+fn event_server_stream_read(
     tk: Token,
     mut tcp_stream: TcpStream,
-    mut bytes_written: usize,
-) -> Result {
-    let to_write = &HTTP_408_RESPONSE[bytes_written..];
+    reader: serverreader::Reader,
+) -> ActionResult {
+    use serverreader::State::*;
 
-    match tcp_stream.write(to_write) {
-        Ok(num_bytes) => {
-            bytes_written += num_bytes;
-            let bytes_remaining = HTTP_408_RESPONSE.len() - bytes_written;
-            if bytes_remaining > 0 {
-                // This function needs to be called again
-                Ok(Action::ContinueWriteReqTimeout((
-                    tk,
-                    tcp_stream,
-                    bytes_remaining,
-                )))
-            } else {
-                Ok(Action::DoneWriteReqTimeout((tk, tcp_stream)))
-            }
+    match reader.read_tcp_stream(&mut tcp_stream) {
+        Err(error) => Err(ActionError {
+            token: tk,
+            error,
+            source: ErrorSource::Server,
+            tcp_stream,
+        }),
+        Ok(Partial(reader)) => Ok(Action::ServerContinueRead((tk, reader, tcp_stream))),
+        Ok(Complete(http_req)) => Ok(Action::ServerReadDone((tk, http_req, tcp_stream))),
+        Ok(StreamEOF) => Ok(Action::ServerStreamEOF((tk, tcp_stream))),
+    }
+}
+
+fn event_server_stream_write(
+    tk: Token,
+    mut tcp_stream: TcpStream,
+    writer: serverwriter::Writer,
+) -> ActionResult {
+    use serverwriter::State::*;
+
+    match writer.write_tcp_stream(&mut tcp_stream) {
+        Err(error) => Err(ActionError {
+            token: tk,
+            error,
+            source: ErrorSource::Server,
+            tcp_stream,
+        }),
+        Ok(Partial(writer)) => Ok(Action::ServerContinueWrite((tk, writer, tcp_stream))),
+        Ok(Done(http_resp)) => Ok(Action::ServerDoneWrite((tk, http_resp, tcp_stream))),
+    }
+}
+
+fn event_casket_response_write(
+    tk: Token,
+    mut tcp_stream: TcpStream,
+    mut casket_resp: CasketResponse,
+) -> ActionResult {
+    use std::io::Write;
+
+    match tcp_stream.write(&casket_resp.response[casket_resp.bytes_sent..]) {
+        Ok(sz) => casket_resp.bytes_sent += sz,
+        Err(e) => {
+            return Err(ActionError {
+                token: tk,
+                source: ErrorSource::Server,
+                error: HttpError::Io(("failed to write casket response to tcp stream", e)),
+                tcp_stream,
+            })
         }
-        Err(e) => Err(Error::WriteTimeout((tk, tcp_stream, e))),
     }
-}
 
-fn handle_new_fd(tk: Token, fd: RawFd) -> Result {
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-
-    Ok(Action::NewReadStream((tk, stream)))
-}
-
-fn handle_read_stream(tk: Token, mut stream: TcpStream, reading_stream: ReadingStream) -> Result {
-    match reading_stream.read_tcp_stream(&mut stream) {
-        Err(err) => Err(Error::Read((tk, stream, err))),
-
-        Ok(ReadState::Partial(reading_stream)) => {
-            Ok(Action::ContinueReadStream((tk, stream, reading_stream)))
-        }
-
-        Ok(ReadState::Complete(http_req)) => Ok(Action::NewProcessStream((tk, stream, http_req))),
-
-        Ok(ReadState::StreamEOF) => Ok(Action::StreamEOF((tk, stream))),
+    if casket_resp.bytes_sent == casket_resp.response.len() {
+        Ok(actions::Action::ServerCasketResponseDone((
+            tk,
+            tcp_stream,
+            casket_resp,
+        )))
+    } else {
+        Ok(actions::Action::ServerCasketResponseContinue((
+            tk,
+            tcp_stream,
+            casket_resp,
+        )))
     }
-}
-
-fn handle_write_stream(tk: Token, mut stream: TcpStream, writing_stream: WritingStream) -> Result {
-    match writing_stream.write_tcp_stream(&mut stream) {
-        Err(err) => Err(Error::Write((tk, stream, err))),
-
-        Ok(WriteState::Continue(writing_stream)) => {
-            Ok(Action::ContinueWriteStream((tk, stream, writing_stream)))
-        }
-
-        Ok(WriteState::Done(http_resp)) => Ok(Action::DoneWriteStream((tk, stream, http_resp))),
-    }
-}
-
-fn handle_try_recv_processing_stream(
-    res: result::Result<(usize, HttpResponse), TryRecvError>,
-) -> Result {
-    match res {
-        Ok((key, http_resp)) => Ok(Action::NewWriteStream((key, Box::new(http_resp)))),
-        Err(TryRecvError::Empty) => Ok(Action::None),
-        Err(TryRecvError::Disconnected) => Err(Error::PythonThreadsDied),
-    }
-}
-
-fn too_busy_resp(http_req: Box<HttpRequest>) -> Box<HttpResponse> {
-    Box::new(HttpResponse {
-        method: http_req.method,
-        url: http_req.url,
-        code: 503,
-        reason: String::from("Service Busy"),
-        context: http_req.context,
-        keep_alive: false,
-        req_headers: http_req.headers,
-        req_content_length: http_req.content_length,
-        resp_headers: vec![],
-        resp_content_length: Some(0),
-        resp_body: None,
-    })
 }
