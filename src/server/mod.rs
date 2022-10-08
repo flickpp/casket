@@ -15,6 +15,16 @@ use crate::errors::{fatal_io_error, RuntimeError, RuntimeResult};
 mod unixstreams;
 use unixstreams::{UnixStream as ServerUnixStream, UnixStreams as ServerUnixStreams};
 
+// Assign a number to each new stream
+// Assuming usize is 64 bits, we have a maxmimum of (2^64) / (2^24) = 1_099_511_627_776 streams
+const NEW_STREAM_COUNT_INC: usize = 1 << 24;
+
+// Amount to increment counter for a second request on a keep-alive stream
+// We have (2^24)/(2^7) = 131_072 possible requests on a single stream.
+// Worker may use range [REQUEST_COUNT + 1, REQUEST_COUNT + 127]
+// So a single HTTP request may spawn up to 127 additional items (see worker)
+const KEEP_ALIVE_COUNT_INC: usize = 1 << 7;
+
 pub fn run_server(
     cfg: Arc<Config>,
     running: Arc<AtomicBool>,
@@ -40,6 +50,8 @@ pub fn run_server(
         tk_num += 1;
     }
     let mut unix_streams = ServerUnixStreams::new(server_unix_streams);
+
+    let mut client_stream_count = (NEW_STREAM_COUNT_INC..).step_by(NEW_STREAM_COUNT_INC);
 
     let mut errors = Vec::with_capacity(32);
     let mut reading_streams = HashMap::new();
@@ -83,20 +95,23 @@ pub fn run_server(
                 .remove(&tk)
                 .expect("couldn't find processing tream");
 
+            // Increment
+            let new_tk = Token(tk.0 + KEEP_ALIVE_COUNT_INC);
+
             if run_shutdown {
                 if let Err(e) = tcp_stream.shutdown(std::net::Shutdown::Both) {
                     errors.push(e);
                 }
             } else {
-                if let Err(e) = poll
-                    .registry()
-                    .register(&mut tcp_stream, tk, Interest::READABLE)
+                if let Err(e) =
+                    poll.registry()
+                        .register(&mut tcp_stream, new_tk, Interest::READABLE)
                 {
                     errors.push(e);
                     continue;
                 }
 
-                reading_streams.insert(tk, tcp_stream);
+                reading_streams.insert(new_tk, tcp_stream);
             }
         }
 
@@ -128,8 +143,7 @@ pub fn run_server(
         for ev in &events {
             if ev.token() == SERVER_TOKEN {
                 if let Ok((mut tcp_stream, _)) = listener.accept() {
-                    tk_num += 1;
-                    let tk = Token(tk_num);
+                    let tk = Token(client_stream_count.next().unwrap());
 
                     if reading_streams.len() + processing_streams.len() >= cfg.max_conns {
                         // Drop stream now

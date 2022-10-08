@@ -2,6 +2,9 @@
 Configuration
 -------------------
 
+Out of the box Casket should comfortably handle thousands of requests per-second.
+We have chosen sensible defaults that should be fine in the majority of situations.
+
 All casket configuration is done with environment variables.
 
 CASKET_BIND_ADDR
@@ -30,13 +33,17 @@ Example:
 CASKET_MAX_CONNECTIONS
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``DEFAULT: 128``
+``DEFAULT: 256``
 
 | The maximum number of open, but potentially idle TCP streams.
 | NOTE: This is global and NOT per worker.
 
 If this limit is reached Casket will accept, then immediatly shutdown any
 newer TCP streams. Furthermore we log a warning.
+
+.. code-block:: json
+
+   {"level":"warn", "msg": "maximum number of tcp streams exceeded"}
 
 Example:
 
@@ -48,11 +55,16 @@ Example:
 CASKET_MAX_REQUESTS
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-``DEFAULT: 12``
+``DEFAULT: 64``
 
-The maximum number of active HTTP requests, per worker.
+When a Casket *worker* has received N HTTP requests (header and body) it places them
+into a queue for python threads to execute. If this queue becomes full Casket will return
+an error.
+
+NOTE: This limit is per-worker.
 
 If this limit is reached Casket will send back ``HTTP/1.1 503 Service Busy`` response header.
+See :ref:`status-codes-503`.
 
 Example:
 
@@ -73,7 +85,8 @@ CASKET_RETURN_STACKTRACE_IN_BODY
    to Casket. See :ref:`environ-wsgi-errors` for how Casket implements the
    ``writeline`` function.
 
-``DEFAULT: 1``
+| ``DEFAULT: 1``
+| ``DEFAULT: 0`` (in Casket Docker image)
 
 When a Python exception is caught by Casket, optionally return the stacktrace as HTTP response body.
 
@@ -204,3 +217,55 @@ See :ref:`status-codes-408`.
 Example:
 
 ``CASKET_REQUEST_READ_TIMEOUT=25``
+
+
+.. _config-python-code-gateway-timeout:
+
+CASKET_PYTHON_CODE_GATEWAY_TIMEOUT
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``DEFAULT: 10``
+
+When Python WSGI application starts executing, wait at most time T for a response.
+If response is not received send back ``504 Gateway Timeout``.
+
+See also :ref:`status-codes-504`.
+
+
+Example (code):
+
+.. code-block:: python
+   :linenos:
+
+   from time import sleep
+   from casket.logger import info
+   from flask import Flask
+
+   app = Flask(__name__)
+
+   @app.route('/')
+   def hello_world():
+       sleep(15)
+       info("returning Hello World")
+       return 'Hello World!'
+
+
+If we send a request to this WSGI application - we get the following response.
+(The default is after 10 seconds) as stated above.
+
+.. code-block::
+
+   < HTTP/1.1 504 Gateway Timeout
+   < Server: Casket
+   < Connection: Close
+
+
+We note that the python code will **continue executing**. Therefore after 15 seconds Casket will log:
+
+.. code-block:: json
+
+   {"level": "info", "msg": "returning Hello World"}
+
+Example:
+
+``CASKET_PYTHON_CODE_GATEWAY_TIMEOUT=15``

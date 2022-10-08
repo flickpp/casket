@@ -1,18 +1,11 @@
-use std::io::{self, Read};
-use std::result;
+use std::io::Read;
 
 use mio::net::TcpStream;
 
-use crate::http::{Context, HttpRequest};
+use crate::http::{Context, HttpError, HttpRequest};
 
-pub enum ReadError {
-    Io(io::Error),
-    Httparse(httparse::Error),
-    BadValue(&'static str),
-}
-
-pub enum ReadState {
-    Partial(ReadingStream),
+pub enum State {
+    Partial(Reader),
     Complete(Box<HttpRequest>),
     StreamEOF,
 }
@@ -22,70 +15,75 @@ enum InnerState {
     HaveHeader(Box<PartialHttpReq>),
 }
 
-pub type ReadResult = result::Result<ReadState, ReadError>;
-
-pub struct ReadingStream {
+pub struct Reader {
     state: InnerState,
 }
 
-impl ReadingStream {
-    pub fn empty() -> Self {
+impl Reader {
+    pub fn new() -> Self {
         Self {
             state: InnerState::Begin((0, vec![0; 2048])),
         }
     }
 
-    pub fn read_tcp_stream(mut self, tcp_stream: &mut TcpStream) -> ReadResult {
+    pub fn read_tcp_stream(self, tcp_stream: &mut TcpStream) -> Result<State, HttpError> {
         match self.state {
-            InnerState::Begin((mut buf_len, mut buffer)) => {
-                if buffer.len() - buf_len < 1024 {
-                    buffer.resize(buffer.len() + 4096, 0);
-                }
-
-                let bytes_read = tcp_stream
-                    .read(&mut buffer[buf_len..])
-                    .map_err(ReadError::Io)?;
-
-                if bytes_read == 0 {
-                    return Ok(ReadState::StreamEOF);
-                }
-
-                buf_len += bytes_read;
-
-                // Parse the header
-                let mut headers = [httparse::EMPTY_HEADER; 16];
-                let mut request = httparse::Request::new(&mut headers);
-
-                match request.parse(&buffer[..buf_len]) {
-                    Ok(httparse::Status::Partial) => Ok(ReadState::Partial(Self {
-                        state: InnerState::Begin((buf_len, buffer)),
-                    })),
-                    Err(err) => Err(ReadError::Httparse(err)),
-
-                    Ok(httparse::Status::Complete(header_size)) => {
-                        let mut partial_http_req = PartialHttpReq::new(request)?;
-                        buffer.truncate(buf_len);
-                        partial_http_req.take_body(buffer, header_size)?;
-
-                        if partial_http_req.is_done() {
-                            Ok(ReadState::Complete(Box::new(partial_http_req.into())))
-                        } else {
-                            self.state = InnerState::HaveHeader(Box::new(partial_http_req));
-                            Ok(ReadState::Partial(self))
-                        }
-                    }
-                }
-            }
-
+            InnerState::Begin((buf_len, buf)) => read_header(buf_len, buf, tcp_stream),
             InnerState::HaveHeader(mut partial_http_req) => {
                 partial_http_req.read_tcp_stream(tcp_stream)?;
 
                 if partial_http_req.is_done() {
-                    Ok(ReadState::Complete(Box::new((*partial_http_req).into())))
+                    Ok(State::Complete(Box::new((*partial_http_req).into())))
                 } else {
-                    self.state = InnerState::HaveHeader(partial_http_req);
-                    Ok(ReadState::Partial(self))
+                    Ok(State::Partial(Reader {
+                        state: InnerState::HaveHeader(partial_http_req),
+                    }))
                 }
+            }
+        }
+    }
+}
+
+fn read_header(
+    mut buf_len: usize,
+    mut buf: Vec<u8>,
+    tcp_stream: &mut TcpStream,
+) -> Result<State, HttpError> {
+    if buf.len() - buf_len < 1024 {
+        buf.resize(buf.len() * 2, 0);
+    }
+
+    let bytes_read = tcp_stream
+        .read(&mut buf[buf_len..])
+        .map_err(|e| HttpError::Io(("failed to read tcp stream for server request", e)))?;
+
+    if bytes_read == 0 {
+        return Ok(State::StreamEOF);
+    }
+
+    buf_len += bytes_read;
+
+    let mut headers = [httparse::EMPTY_HEADER; 24];
+    let mut request = httparse::Request::new(&mut headers);
+
+    match request.parse(&buf[..buf_len]) {
+        Err(e) => Err(HttpError::HeaderParse(e)),
+
+        Ok(httparse::Status::Partial) => Ok(State::Partial(Reader {
+            state: InnerState::Begin((buf_len, buf)),
+        })),
+
+        Ok(httparse::Status::Complete(header_size)) => {
+            let mut partial_http_req = PartialHttpReq::new(request)?;
+            buf.truncate(buf_len);
+            partial_http_req.take_body(buf, header_size)?;
+
+            if partial_http_req.is_done() {
+                Ok(State::Complete(Box::new(partial_http_req.into())))
+            } else {
+                Ok(State::Partial(Reader {
+                    state: InnerState::HaveHeader(Box::new(partial_http_req)),
+                }))
             }
         }
     }
@@ -103,30 +101,15 @@ struct PartialHttpReq {
     context: Context,
 }
 
-impl From<PartialHttpReq> for HttpRequest {
-    fn from(req: PartialHttpReq) -> HttpRequest {
-        HttpRequest {
-            method: req.method,
-            url: req.url,
-            headers: req.headers,
-            context: req.context,
-            keep_alive: req.keep_alive,
-            content_type: req.content_type,
-            content_length: req.content_length,
-            body: Some(req.body),
-        }
-    }
-}
-
 impl PartialHttpReq {
-    fn new(request: httparse::Request<'_, '_>) -> result::Result<Self, ReadError> {
+    fn new(request: httparse::Request<'_, '_>) -> Result<Self, HttpError> {
         let mut headers = vec![];
 
         let method = request
             .method
             .expect("request not parsed")
             .parse::<http_types::Method>()
-            .map_err(|_| ReadError::BadValue("http request with unrecognised method"))?;
+            .map_err(|_| HttpError::BadValue("http request with unrecognised method"))?;
 
         let mut content_type: Option<String> = None;
         let mut host: Option<&str> = None;
@@ -136,7 +119,7 @@ impl PartialHttpReq {
 
         for h in request.headers {
             let value = std::str::from_utf8(h.value)
-                .map_err(|_| ReadError::BadValue("header value not utf8"))?;
+                .map_err(|_| HttpError::BadValue("header value not utf8"))?;
 
             if h.name.eq_ignore_ascii_case("Content-Type") {
                 content_type = Some(value.to_string());
@@ -145,7 +128,7 @@ impl PartialHttpReq {
             if h.name.eq_ignore_ascii_case("Content-Length") {
                 content_length = value
                     .parse()
-                    .map_err(|_| ReadError::BadValue("Content-Length not uint"))?;
+                    .map_err(|_| HttpError::BadValue("Content-Length not uint"))?;
             }
 
             if h.name.eq_ignore_ascii_case("Host") {
@@ -165,7 +148,7 @@ impl PartialHttpReq {
             headers.push((h.name.to_string(), value.to_string()));
         }
 
-        let host = host.ok_or(ReadError::BadValue("http request missing host header"))?;
+        let host = host.ok_or(HttpError::BadValue("http request missing host header"))?;
 
         Ok(Self {
             method,
@@ -180,10 +163,10 @@ impl PartialHttpReq {
         })
     }
 
-    fn take_body(&mut self, buffer: Vec<u8>, header_size: usize) -> result::Result<(), ReadError> {
+    fn take_body(&mut self, buffer: Vec<u8>, header_size: usize) -> Result<(), HttpError> {
         if buffer[header_size..].len() > self.content_length {
             // Too many bytes in buffer
-            return Err(ReadError::BadValue("content-length too large"));
+            return Err(HttpError::BadValue("content-length too large"));
         }
 
         self.body.reserve(self.content_length);
@@ -194,10 +177,16 @@ impl PartialHttpReq {
         Ok(())
     }
 
-    fn read_tcp_stream(&mut self, tcp_stream: &mut TcpStream) -> result::Result<(), ReadError> {
-        self.bytes_read += tcp_stream
+    fn read_tcp_stream(&mut self, tcp_stream: &mut TcpStream) -> Result<(), HttpError> {
+        let bytes_read = tcp_stream
             .read(&mut self.body[self.bytes_read..])
-            .map_err(ReadError::Io)?;
+            .map_err(|e| HttpError::Io(("failed to ready request body on tcp stream", e)))?;
+
+        if bytes_read == 0 {
+            return Err(HttpError::BadValue("stream EOF without complete body"));
+        }
+
+        self.bytes_read += bytes_read;
 
         Ok(())
     }
@@ -207,18 +196,33 @@ impl PartialHttpReq {
     }
 }
 
-fn url(host: &str, path: &str) -> result::Result<http_types::Url, ReadError> {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        http_types::Url::parse(path).map_err(|_| ReadError::BadValue("invalid http path"))
-    } else if path.starts_with('/') {
-        http_types::Url::parse(&format!("http://{}{}", host, path))
-            .map_err(|_| ReadError::BadValue("invalid path in http header"))
-    } else {
-        Err(ReadError::BadValue("invalid path in http header"))
+impl From<PartialHttpReq> for HttpRequest {
+    fn from(req: PartialHttpReq) -> HttpRequest {
+        HttpRequest {
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            context: req.context,
+            keep_alive: req.keep_alive,
+            content_type: req.content_type,
+            content_length: req.content_length,
+            body: Some(req.body),
+        }
     }
 }
 
-fn parse_context(val: &str) -> result::Result<Context, &'static str> {
+fn url(host: &str, path: &str) -> Result<http_types::Url, HttpError> {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        http_types::Url::parse(path).map_err(|_| HttpError::BadValue("invalid http path"))
+    } else if path.starts_with('/') {
+        http_types::Url::parse(&format!("http://{}{}", host, path))
+            .map_err(|_| HttpError::BadValue("invalid path in http header"))
+    } else {
+        Err(HttpError::BadValue("invalid path in http header"))
+    }
+}
+
+fn parse_context(val: &str) -> Result<Context, &'static str> {
     let mut trace_id = "";
     let mut parent_id = "";
 

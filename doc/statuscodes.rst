@@ -9,12 +9,22 @@ This list is exhaustive.
 
 Casket catches a Python exception.
 
+.. _status-codes-503:
 
 503 - Service Busy
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 Casket worker has reached ``CASKET_MAX_REQUESTS`` limit.
 See :ref:`config-max-requests`.
+
+
+.. _status-codes-504:
+
+504 - Gateway Timeout
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Casket worker has reached ``CASKET_PYTHON_CODE_GATEWAY_TIMEOUT`` limit.
+See :ref:`config-python-code-gateway-timeout`.
 
 
 .. _status-codes-408:
